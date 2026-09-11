@@ -650,7 +650,7 @@ async function 激活访问授权上下文(上下文) {
 		await session.prepare(`UPDATE access_links
 			SET proxy_ip = COALESCE(proxy_ip, ?1),
 				first_used_at = COALESCE(first_used_at, ?2),
-				expires_at = COALESCE(expires_at, ?2 + duration_seconds * 1000),
+				expires_at = CASE WHEN duration_seconds = 0 THEN NULL ELSE COALESCE(expires_at, ?2 + duration_seconds * 1000) END,
 				last_used_at = ?2
 			WHERE token = ?3 AND status = 'active' AND (expires_at IS NULL OR expires_at > ?2)`)
 			.bind(选定反代IP, now, 记录.token).run();
@@ -732,7 +732,8 @@ function 生成访问节点链接(config, 记录) {
 	const ECHLINK参数 = config.ECH ? `&ech=${encodeURIComponent((config.ECHConfig?.SNI ? config.ECHConfig.SNI + '+' : '') + config.ECHConfig?.DNS)}` : '';
 	const { type: 传输协议, 路径字段名, 域名字段名 } = 获取传输协议配置(config);
 	const 传输路径参数值 = 获取传输路径参数值(config, 完整节点路径);
-	const 名称 = encodeURIComponent(记录.note || `${记录.country}-${Math.round(Number(记录.duration_seconds) / 3600 * 100) / 100}小时`);
+	const 时长名称 = Number(记录.duration_seconds) === 0 ? '永久' : `${Math.round(Number(记录.duration_seconds) / 3600 * 100) / 100}小时`;
+	const 名称 = encodeURIComponent(记录.note || `${记录.country}-${时长名称}`);
 	if (config.协议类型 === 'ss') {
 		const ssPath = 完整节点路径.includes('?') ? 完整节点路径.replace('?', `?enc=${config.SS.加密方式}&`) : `${完整节点路径}?enc=${config.SS.加密方式}`;
 		return `ss://${btoa(config.SS.加密方式 + ':' + 记录.uuid)}@${host}:${config.SS.TLS ? '443' : '80'}?plugin=v2${encodeURIComponent(`ray-plugin;mode=websocket;host=${host};path=${ssPath}${config.SS.TLS ? ';tls' : ''};mux=0`)}${ECHLINK参数}#${名称}`;
@@ -740,10 +741,36 @@ function 生成访问节点链接(config, 记录) {
 	return `${config.协议类型}://${记录.uuid}@${host}:443?security=tls&type=${传输协议}${ECHLINK参数}&${域名字段名}=${host}&fp=${config.Fingerprint}&sni=${host}&${路径字段名}=${encodeURIComponent(传输路径参数值)}${TLS分片参数}&encryption=none${config.跳过证书验证 ? '&insecure=1&allowInsecure=1' : ''}#${名称}`;
 }
 
+const 访问国家代码列表 = Object.freeze(`AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ
+BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ
+CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ
+DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR
+GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY
+HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP
+KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY
+MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ
+NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY
+QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ
+TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ
+VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW`.split(/\s+/));
+const 访问国家代码集合 = new Set(访问国家代码列表);
+let 访问国家显示名称格式器 = null;
+try { 访问国家显示名称格式器 = new Intl.DisplayNames(['zh-CN'], { type: 'region' }); } catch (_) { }
+const 访问国家名称代码映射 = new Map(访问国家代码列表.map(code => [访问国家显示名称格式器?.of(code) || code, code]));
+
 function 标准化访问国家(value) {
-	const country = String(value || '').trim().toUpperCase();
-	if (!country || country.length > 32 || !/^[\p{L}\p{N} _.-]+$/u.test(country)) throw new Error('国家代码/名称格式不正确');
-	return country;
+	const input = String(value || '').trim();
+	const country = input.toUpperCase();
+	if (访问国家代码集合.has(country)) return country;
+	const optionCode = input.match(/\(([A-Za-z]{2})\)\s*$/)?.[1]?.toUpperCase();
+	if (访问国家代码集合.has(optionCode)) return optionCode;
+	const nameCode = 访问国家名称代码映射.get(input);
+	if (nameCode) return nameCode;
+	throw new Error('请选择系统提供的国家或地区');
+}
+
+function 生成访问国家选项() {
+	return 访问国家代码列表.map(code => `<option value="${code}">${访问国家显示名称格式器?.of(code) || code} (${code})</option>`).join('');
 }
 
 function 标准化访问PROXYIP(value) {
@@ -764,6 +791,7 @@ function 格式化后台访问记录(记录, config, origin) {
 		...记录,
 		display_status,
 		duration_hours: Number(记录.duration_seconds) / 3600,
+		duration_label: Number(记录.duration_seconds) === 0 ? '永久' : `${Number(记录.duration_seconds) / 3600} 小时`,
 		subscription_url: `${origin}/sub?token=${encodeURIComponent(记录.token)}`,
 		node_url: 独立配置.LINK
 	};
@@ -785,7 +813,7 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 				session.prepare('SELECT * FROM proxy_ip_pool ORDER BY country, id DESC').all(),
 				session.prepare(`SELECT COUNT(*) AS total,
 					SUM(CASE WHEN status = 'active' AND first_used_at IS NULL THEN 1 ELSE 0 END) AS unused,
-					SUM(CASE WHEN status = 'active' AND first_used_at IS NOT NULL AND expires_at > ?1 THEN 1 ELSE 0 END) AS active,
+					SUM(CASE WHEN status = 'active' AND first_used_at IS NOT NULL AND (expires_at IS NULL OR expires_at > ?1) THEN 1 ELSE 0 END) AS active,
 					SUM(CASE WHEN status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?1 THEN 1 ELSE 0 END) AS expired,
 					SUM(CASE WHEN status <> 'active' THEN 1 ELSE 0 END) AS revoked
 					FROM access_links`).bind(Date.now()).first()
@@ -806,12 +834,14 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 
 		if (pathname === '/admin/access/api/links') {
 			const country = 标准化访问国家(body.country);
-			const durationHours = Number(body.durationHours);
+			const durationValue = String(body.durationHours ?? '').trim().toLowerCase();
+			const isPermanent = durationValue === 'permanent' || durationValue === '永久';
+			const durationHours = isPermanent ? null : Number(durationValue);
 			const count = Math.floor(Number(body.count || 1));
 			const note = String(body.note || '').trim().slice(0, 100);
-			if (!Number.isFinite(durationHours) || durationHours < 1 / 60 || durationHours > 8760) throw new Error('有效时长必须在 1 分钟到 8760 小时之间');
+			if (!isPermanent && (!Number.isInteger(durationHours) || durationHours < 1 || durationHours > 8760)) throw new Error('有效时长必须是 1 到 8760 的整数小时，或选择永久');
 			if (!Number.isInteger(count) || count < 1 || count > 100) throw new Error('单次生成数量必须是 1 到 100');
-			const durationSeconds = Math.max(60, Math.round(durationHours * 3600));
+			const durationSeconds = isPermanent ? 0 : durationHours * 3600;
 			const createdAt = Date.now();
 			const records = Array.from({ length: count }, (_, index) => ({
 				token: 生成随机访问令牌(),
@@ -873,13 +903,15 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 }
 
 function 访问链接管理页面() {
+	const 国家选项HTML = 生成访问国家选项();
 	const html = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>限时访问链接</title><style>
 :root{color-scheme:dark;--bg:#09111f;--panel:#111c2e;--line:#263550;--text:#e8eef9;--muted:#91a0b9;--blue:#4f8cff;--red:#ff6078;--green:#39d98a}*{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#07101d,#0d1830);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1440px;margin:auto;padding:24px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px}.top a{color:#9ec0ff}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:20px 0}.card{background:rgba(17,28,46,.94);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 14px 40px #0003}h1,h2{margin:0 0 14px}label{display:block;color:var(--muted);margin:9px 0 5px}input,textarea,select,button{font:inherit}input,textarea,select{width:100%;background:#091425;color:var(--text);border:1px solid #344563;border-radius:8px;padding:10px}textarea{min-height:110px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}button{border:0;border-radius:8px;padding:9px 12px;background:var(--blue);color:white;cursor:pointer}button.alt{background:#344563}button.danger{background:#8b3040}button.small{padding:5px 8px;font-size:12px;margin:2px}.msg{min-height:22px;margin-top:10px;color:var(--green)}.stats{display:flex;gap:9px;flex-wrap:wrap;margin:16px 0}.pill{background:#16243a;border:1px solid var(--line);padding:7px 11px;border-radius:999px}.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:10px}table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #22314a;vertical-align:top}th{color:#aebbd0;background:#142138;position:sticky;top:0}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.unused{color:#f6c85f}.active{color:var(--green)}.expired,.revoked{color:var(--red)}.muted{color:var(--muted)}@media(max-width:800px){.grid{grid-template-columns:1fr}.row{grid-template-columns:1fr}.wrap{padding:14px}}
 </style></head><body><main class="wrap"><div class="top"><div><h1>限时访问链接</h1><div class="muted">首次真实代理连接才分配 PROXYIP 并开始计时</div></div><a href="/admin">返回原后台</a></div>
-<div class="stats" id="stats"></div><section class="grid"><form class="card" id="createForm"><h2>生成访问链接</h2><div class="row"><div><label>国家代码或名称</label><input name="country" list="countries" placeholder="例如 HK / US / JP" required><datalist id="countries"></datalist></div><div><label>有效时长（小时）</label><input name="durationHours" type="number" min="0.0167" max="8760" step="0.25" value="3" required></div></div><div class="row"><div><label>生成数量（单次最多 100）</label><input name="count" type="number" min="1" max="100" value="1" required></div><div><label>备注</label><input name="note" maxlength="100" placeholder="可留空"></div></div><p><button type="submit">生成链接</button></p><div class="msg" id="createMsg"></div></form>
-<form class="card" id="poolForm"><h2>维护国家 PROXYIP 池</h2><label>国家代码或名称</label><input name="country" placeholder="例如 HK" required><label>PROXYIP（每行或逗号分隔）</label><textarea name="proxyIps" placeholder="38.54.59.70\nproxy.example.com:443" required></textarea><button type="submit">加入 IP 池</button><div class="msg" id="poolMsg"></div></form></section>
+<div class="stats" id="stats"></div><section class="grid"><form class="card" id="createForm"><h2>生成访问链接</h2><div class="row"><div><label>国家代码或名称</label><input name="country" list="countryOptions" placeholder="输入名称或代码搜索" autocomplete="off" required></div><div><label>有效时长（小时）</label><input name="durationHours" list="durationOptions" value="3" inputmode="numeric" placeholder="输入整数小时或选择永久" autocomplete="off" required></div></div><div class="row"><div><label>生成数量（单次最多 100）</label><input name="count" type="number" min="1" max="100" value="1" required></div><div><label>备注</label><input name="note" maxlength="100" placeholder="可留空"></div></div><p><button type="submit">生成链接</button></p><div class="msg" id="createMsg"></div></form>
+<form class="card" id="poolForm"><h2>维护国家 PROXYIP 池</h2><label>国家代码或名称</label><input name="country" list="countryOptions" placeholder="输入名称或代码搜索" autocomplete="off" required><label>PROXYIP（每行或逗号分隔）</label><textarea name="proxyIps" placeholder="38.54.59.70\nproxy.example.com:443" required></textarea><button type="submit">加入 IP 池</button><div class="msg" id="poolMsg"></div></form></section>
+<datalist id="countryOptions">${国家选项HTML}</datalist><datalist id="durationOptions"><option value="1">1 小时</option><option value="3">3 小时</option><option value="5">5 小时</option><option value="8">8 小时</option><option value="12">12 小时</option><option value="24">24 小时</option><option value="48">48 小时</option><option value="72">72 小时</option><option value="permanent">永久</option></datalist>
 <section class="card"><h2>访问链接</h2><div class="tablewrap"><table><thead><tr><th>ID / 备注</th><th>国家</th><th>状态</th><th>时长</th><th>PROXYIP</th><th>首次使用 / 到期</th><th>链接</th><th>操作</th></tr></thead><tbody id="links"></tbody></table></div></section>
 <section class="card" style="margin-top:18px"><h2>国家 IP 池</h2><div class="tablewrap"><table style="min-width:700px"><thead><tr><th>ID</th><th>国家</th><th>PROXYIP</th><th>状态</th><th>操作</th></tr></thead><tbody id="pools"></tbody></table></div></section></main>
 <script>
@@ -888,8 +920,7 @@ const fmt=v=>v?new Date(Number(v)).toLocaleString():'—';
 async function api(path,options){const r=await fetch('/admin/access/api/'+path,{headers:{'Content-Type':'application/json'},...options});const j=await r.json().catch(()=>({error:'响应格式错误'}));if(!r.ok||j.success===false)throw new Error(j.error||'请求失败');return j}
 function button(text,attrs,cls='small alt'){return '<button type="button" class="'+cls+'" '+attrs+'>'+text+'</button>'}
 async function load(){try{const d=await api('state');const s=d.stats||{};$('#stats').innerHTML=['总计 '+(s.total||0),'未使用 '+(s.unused||0),'使用中 '+(s.active||0),'已过期 '+(s.expired||0),'已停用 '+(s.revoked||0)].map(x=>'<span class="pill">'+x+'</span>').join('');
-const countries=[...new Set(d.pools.map(x=>x.country))];$('#countries').innerHTML=countries.map(x=>'<option value="'+esc(x)+'">').join('');
-const names={unused:'未使用',active:'使用中',expired:'已过期',revoked:'已停用'};$('#links').innerHTML=d.links.map(x=>'<tr><td><b>#'+x.id+'</b><br>'+esc(x.note||'—')+'<br><span class="mono muted">'+esc(x.uuid)+'</span></td><td>'+esc(x.country)+'</td><td class="'+x.display_status+'">'+names[x.display_status]+'</td><td>'+esc(x.duration_hours)+' 小时</td><td class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'</td><td>'+fmt(x.first_used_at)+'<br>'+fmt(x.expires_at)+'</td><td>'+button('复制订阅','data-copy="'+esc(x.subscription_url)+'"')+button('复制节点','data-copy="'+esc(x.node_url)+'"')+'</td><td>'+button(x.status==='active'?'停用':'启用','data-id="'+x.id+'" data-action="'+(x.status==='active'?'revoke':'enable')+'"',x.status==='active'?'small danger':'small')+button('重置计时','data-id="'+x.id+'" data-action="reset"')+button('重选 IP','data-id="'+x.id+'" data-action="reassign"')+button('删除','data-id="'+x.id+'" data-action="delete"','small danger')+'</td></tr>').join('')||'<tr><td colspan="8" class="muted">暂无链接</td></tr>';
+const names={unused:'未使用',active:'使用中',expired:'已过期',revoked:'已停用'};$('#links').innerHTML=d.links.map(x=>'<tr><td><b>#'+x.id+'</b><br>'+esc(x.note||'—')+'<br><span class="mono muted">'+esc(x.uuid)+'</span></td><td>'+esc(x.country)+'</td><td class="'+x.display_status+'">'+names[x.display_status]+'</td><td>'+esc(x.duration_label)+'</td><td class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'</td><td>'+fmt(x.first_used_at)+'<br>'+(Number(x.duration_seconds)===0?'永久':fmt(x.expires_at))+'</td><td>'+button('复制订阅','data-copy="'+esc(x.subscription_url)+'"')+button('复制节点','data-copy="'+esc(x.node_url)+'"')+'</td><td>'+button(x.status==='active'?'停用':'启用','data-id="'+x.id+'" data-action="'+(x.status==='active'?'revoke':'enable')+'"',x.status==='active'?'small danger':'small')+button('重置计时','data-id="'+x.id+'" data-action="reset"')+button('重选 IP','data-id="'+x.id+'" data-action="reassign"')+button('删除','data-id="'+x.id+'" data-action="delete"','small danger')+'</td></tr>').join('')||'<tr><td colspan="8" class="muted">暂无链接</td></tr>';
 $('#pools').innerHTML=d.pools.map(x=>'<tr><td>#'+x.id+'</td><td>'+esc(x.country)+'</td><td class="mono">'+esc(x.proxy_ip)+'</td><td>'+(x.enabled?'启用':'停用')+'</td><td>'+button(x.enabled?'停用':'启用','data-pool-id="'+x.id+'" data-pool-action="'+(x.enabled?'disable':'enable')+'"')+button('删除','data-pool-id="'+x.id+'" data-pool-action="delete"','small danger')+'</td></tr>').join('')||'<tr><td colspan="5" class="muted">暂无 PROXYIP，请先添加</td></tr>';}catch(e){alert(e.message)}}
 $('#createForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.target);try{const d=await api('links',{method:'POST',body:JSON.stringify(Object.fromEntries(f))});$('#createMsg').textContent=d.message;await load()}catch(err){$('#createMsg').textContent=err.message}});
 $('#poolForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.target);try{const d=await api('pools',{method:'POST',body:JSON.stringify(Object.fromEntries(f))});$('#poolMsg').textContent=d.message;await load()}catch(err){$('#poolMsg').textContent=err.message}});
