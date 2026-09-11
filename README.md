@@ -127,18 +127,43 @@
 | **DEBUG** | ❌ | `1`或`true` | **开发者模式**，默认关闭调试日志功能（console.log），设置`1`或`true`则开启调试日志功能 |
 | **OFF_LOG** | ❌ | `1`或`true` | 默认开启日志记录功能，设置`1`或`true`则关闭日志记录功能 |
 | **BEST_SUB** | ❌ | `1`或`true` | 默认关闭作为**优选订阅生成器**的功能，设置`1`或`true`则开启该功能 |
+| **RECORD_CLIENT_IP** | ❌ | `false` | 是否在访问链接中记录最后客户端 IP；首次 IP 绑定开启时仍需在 `bound_ip` 保存绑定值 |
+| **RECORD_ADMIN_IP** | ❌ | `true` | 是否在管理员会话和审计日志中记录来源 IP，默认开启 |
+| **ADMIN_SESSION_TTL_SECONDS** | ❌ | `86400` | 管理员随机会话有效期（900～604800 秒） |
+| **ADMIN_LOGIN_MAX_FAILURES** | ❌ | `5` | 10 分钟窗口内允许的登录失败次数 |
+| **ADMIN_LOGIN_BLOCK_SECONDS** | ❌ | `900` | 达到失败阈值后的封禁秒数 |
+| **ACCESS_STATUS_CHECK_SECONDS** | ❌ | `30` | 无 Durable Object 模式下，活动连接检查停用/到期状态的间隔（10～60 秒） |
+| **PROXYIP_FAILURE_THRESHOLD** | ❌ | `3` | PROXYIP 连续失败后的自动隔离阈值 |
+| **PROXYIP_COOLDOWN_MINUTES** | ❌ | `30` | 隔离冷却时间 |
+| **MIN_HEALTHY_IPS_PER_COUNTRY** | ❌ | `3` | 每个国家的默认最低健康 IP 数，可在管理页逐国覆盖 |
+| **CRON_COUNTRY_BATCH_SIZE** | ❌ | `8` | 每次定时任务处理的国家数（最多 20） |
+| **CRON_HEALTH_BATCH_SIZE** | ❌ | `6` | 定时任务每个国家检测的 IP 数（最多 24） |
+| **NOTIFY_WEBHOOK_URL** | ❌ | `https://...` | 可选 HTTPS Webhook；未配置时不影响任何功能 |
+| **TELEGRAM_BOT_TOKEN** / **TELEGRAM_CHAT_ID** | ❌ | — | 可选 Telegram 通知配置，建议使用 Secret 保存 Token |
+| **ABNORMAL_CONNECTIONS_PER_HOUR** | ❌ | `500` | 单链接每小时异常连接量通知阈值 |
+| **AUDIT_RETENTION_DAYS** | ❌ | `90` | 定时清理审计日志的保留天数（7～365） |
 
 ---
 
 ## ⏳ 限时访问链接与国家 PROXYIP 池
 
-本版本新增 `/admin/access` 管理页。管理员可以先维护国家 PROXYIP 池，再按国家、时长和数量生成独立订阅及节点链接。
+`/admin/access` 是限时访问、健康 IP、审计和批量运维的统一管理页。管理员可以按国家生成独立订阅及节点链接，并为每条链接设置并发上限、累计连接上限、首次 IP 绑定、标签和备注。
 
 - 生成链接时只保存国家，不会预先分配 PROXYIP。
 - 打开或更新订阅不会开始计时。
 - 客户端第一次通过协议验证并实际连接时，才从指定国家池随机分配一个 PROXYIP，同时写入首次使用和到期时间。
-- 后续连接固定使用已分配的 PROXYIP；后台可以重选 IP、重置计时、停用或删除链接。
-- 到期后订阅与新的代理连接都会被拒绝，已经建立的连接也会在到期时关闭。
+- 每次真实连接原子更新最后使用时间、累计/活动连接数；连接结束会释放计数，Worker 异常退出时由 90 秒租约和定时任务自愈。
+- 已分配 PROXYIP 连续失败后自动隔离并冷却；连接会选择同国家健康备用 IP，同时更新链接分配并写入审计日志。
+- 到期后订阅与新的代理连接都会被拒绝；已建立连接会在到期定时器或周期状态检查中关闭。
+
+操作语义：
+
+- **停用**：禁止新连接；当前 Worker 实例立即关闭连接，其他实例在下一次状态检查时关闭。
+- **恢复**：只恢复被停用且尚未过期的链接。已过期链接必须使用“续期”。
+- **续期**：从“当前到期时间”和“当前时间”中较晚者开始增加指定时长，并恢复为可用。
+- **重置计时**：清除首次使用、到期、已分配 IP、绑定和使用统计，下一次真实连接重新开始。
+- **重选 IP**：只更换 PROXYIP，保留计时、绑定和统计。
+- **轮换凭据**：可轮换 Token、UUID 或两者；旧凭据不能再建立新连接，其余数据保持不变。
 
 此功能需要一个绑定名为 `DB` 的 Cloudflare D1 数据库。使用 Wrangler 部署时：
 
@@ -153,7 +178,36 @@ npx wrangler d1 migrations apply edgetunnel-access --remote
 npx wrangler deploy
 ```
 
-使用 Pages 部署时，也可以在 Cloudflare 控制台的项目设置中添加 D1 绑定，变量名必须填写 `DB`，然后重新部署。数据表会在第一次访问管理页时自动检查并创建。
+已有数据库升级时也必须执行上面的 migrations 命令。当前 schema 版本为 **5**，新增迁移如下：
+
+- `0003_access_link_limits.sql`：连接统计、限制、IP 绑定、标签、连接租约和连接事件。
+- `0004_proxy_health.sql`：健康评分、连续失败、冷却、真实流量结果和国家阈值。
+- `0005_admin_security_audit.sql`：随机管理员会话、登录限速、审计日志、通知去重和 schema 元数据。
+
+使用 Pages 部署时，也可以在 Cloudflare 控制台为项目添加绑定名为 `DB` 的 D1 数据库。请在 D1 控制台执行迁移，或从本地使用 Wrangler 对同一数据库执行迁移，然后重新部署。运行时仍会兼容旧版“首次访问自动补表”，但正式部署应以 migration 记录为准。
+
+### 管理员安全
+
+- 后台密码现在只读取显式 `ADMIN`，不会再静默使用 `UUID`、`KEY`、`TOKEN` 等变量。
+- 登录成功后生成随机 session 和 CSRF token；D1/KV 只保存 SHA-256 hash。Cookie 使用 `HttpOnly`（会话）、`Secure`、`SameSite=Strict`。
+- 旧 `auth` MD5 Cookie 会被清除，升级后需要重新登录。
+- 所有 `/admin/access/api/*` 修改请求同时校验安全会话、严格 Origin、JSON Content-Type 和 CSRF header。
+- 管理页支持退出当前会话（`/logout`）与“退出所有设备”。
+
+### 审计、导出、恢复与通知
+
+- 审计日志覆盖登录、链接生命周期、轮换、批量操作、IP 池/数据源、阈值、备份恢复和自动故障转移，支持搜索、分页及 JSON/CSV 导出。
+- 敏感链接和 D1 备份导出必须在页面内明确确认，响应包含 `no-store` 和 `Referrer-Policy: no-referrer`。备份不会包含管理员会话。
+- 恢复先校验 product/schema version，默认使用“不覆盖”合并；覆盖模式必须二次输入 `RESTORE OVERWRITE`。
+- Webhook / Telegram 完全可选，并通过事件键和冷却时间去重。通知包括数据源连续失败、低容量、自动故障转移、异常连接量和即将到期。
+
+### Workers、Pages 与实时断开限制
+
+默认模式同时兼容 Workers 和 Pages：同一实例可立即断开被停用连接，跨实例通过 D1 状态轮询（默认最多约 30 秒）发现停用、重置或到期。连接租约在 Worker 异常退出后约 90 秒过期，随后由 cron 校正活动连接数。
+
+Durable Object 可以把某一链接的所有长连接集中到单一协调实例，实现跨 Worker 的近实时广播断开。Pages 可以绑定一个**单独部署的 Durable Object Worker**，但不能在 Pages 项目内创建和部署 DO；配置还必须覆盖 Production 与 Preview。为保持现有 Pages 部署可用，本仓库没有强制启用 DO。当前实现不会因缺少 DO 而降级认证、限额或审计，只影响跨实例断开的即时性。参见 [Cloudflare Pages Durable Object bindings](https://developers.cloudflare.com/pages/functions/bindings/#durable-objects)。
+
+Cloudflare Pages 当前不支持 Cron Triggers，而 Workers 支持。因此 `scheduled()` 中的分批健康检查、通知扫描和保留期清理只会在 Workers 部署自动执行；Pages 部署仍会在真实连接、生成链接、手动同步/检测和打开管理页时更新健康/租约状态，但若要固定周期执行，应部署一个共享同一 D1 的小型定时 Worker，或迁移到 Workers Static Assets。参见 [Workers 与 Pages 能力矩阵](https://developers.cloudflare.com/workers/static-assets/migration-guides/migrate-from-pages/#compatibility-matrix)。
 
 管理入口：`https://你的域名/admin/access`
 

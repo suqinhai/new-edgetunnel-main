@@ -15,3 +15,21 @@ crons = ["*/15 * * * *"]
 #database_name = "edgetunnel-access"
 #database_id = ""
 #migrations_dir = "migrations"
+
+# ADMIN 请使用 `npx wrangler secret put ADMIN` 设置，不要把真实密码写入本文件。
+# 以下均为可选调优变量；取消注释 [vars] 后按需启用。
+#[vars]
+#RECORD_CLIENT_IP = "false"
+#RECORD_ADMIN_IP = "false"
+#ADMIN_SESSION_TTL_SECONDS = "86400"
+#ADMIN_LOGIN_MAX_FAILURES = "5"
+#ADMIN_LOGIN_BLOCK_SECONDS = "900"
+#ACCESS_STATUS_CHECK_SECONDS = "30"
+#PROXYIP_FAILURE_THRESHOLD = "3"
+#PROXYIP_COOLDOWN_MINUTES = "30"
+#MIN_HEALTHY_IPS_PER_COUNTRY = "3"
+#CRON_COUNTRY_BATCH_SIZE = "8"
+#CRON_HEALTH_BATCH_SIZE = "6"
+#ABNORMAL_CONNECTIONS_PER_HOUR = "500"
+#AUDIT_RETENTION_DAYS = "90"
+# NOTIFY_WEBHOOK_URL、TELEGRAM_BOT_TOKEN 建议使用 secret；TELEGRAM_CHAT_ID 可作为普通变量。

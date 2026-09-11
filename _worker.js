@@ -1,7 +1,9 @@
 ﻿const Version = '2026-05-17 18:52:03';
+const 访问管理增强版本 = '2026-09-11 00:00:00';
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓存反代数组索引 = 0, 启用反代兜底 = true, 调试日志打印 = false;
 let 访问数据库初始化任务 = null;
+const 本实例活动访问连接 = new Map();
 const 反代解析缓存 = new Map();
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
@@ -23,9 +25,10 @@ export default {
 		const url = new URL(请求URL文本);
 		const UA = request.headers.get('User-Agent') || 'null';
 		const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase(), contentType = (request.headers.get('content-type') || '').toLowerCase();
-		const 管理员密码 = env.ADMIN || env.admin || env.PASSWORD || env.password || env.pswd || env.TOKEN || env.KEY || env.UUID || env.uuid;
+		// 管理密码只接受显式 ADMIN，绝不再回退到 UUID、KEY 或 Token 等业务密钥。
+		const 管理员密码 = typeof env.ADMIN === 'string' ? env.ADMIN.replace(/[\r\n]/g, '') : '';
 		const 加密秘钥 = env.KEY || '勿动此默认密钥，有需求请自行通过添加变量KEY进行修改';
-		const userIDMD5 = await MD5MD5(管理员密码 + 加密秘钥);
+		const userIDMD5 = await MD5MD5((管理员密码 || '') + 加密秘钥);
 		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
 		const envUUID = env.UUID || env.uuid;
 		const userID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
@@ -45,7 +48,7 @@ export default {
 					if (访问记录) {
 						const 状态错误 = 获取访问记录状态错误(访问记录);
 						if (状态错误) return 访问错误响应(状态错误.message, 状态错误.status);
-						访问授权上下文 = 创建访问授权上下文(env, 访问记录);
+						访问授权上下文 = 创建访问授权上下文(env, 访问记录, request);
 					} else return 访问错误响应('访问链接不存在或已删除', 403);
 				} catch (error) {
 					console.error('读取访问链接失败:', error);
@@ -66,7 +69,7 @@ export default {
 			缓存SOCKS5白名单 = SOCKS5白名单;
 		} else SOCKS5白名单 = 缓存SOCKS5白名单;
 		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {// 版本信息接口
-			return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+			return new Response(JSON.stringify({ Version: Number(String(访问管理增强版本 || Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
 			if (!访问授权上下文) await 反代参数获取(url, 请求用户ID);
 			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
@@ -84,15 +87,20 @@ export default {
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
 			if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
-			// 限时访问管理页及其 API 必须先通过管理员登录，即使当前没有绑定 KV。
-			// 认证不能依赖下方的 KV 分支，否则无 KV 部署会直接落到伪装页流程。
+			// 登录、登出和限时访问后台不依赖 KV；D1 或 KV 都可以保存随机会话。
+			if (访问路径 === 'login') return await 处理管理员登录请求(request, env, url, 管理员密码);
+			if (访问路径 === 'logout') return await 处理管理员单会话退出(request, env, url);
+			let 管理员会话 = null;
 			if (访问路径 === 'admin/access' || 访问路径.startsWith('admin/access/')) {
-				const cookies = request.headers.get('Cookie') || '';
-				const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-				if (!authCookie || authCookie !== await MD5MD5(UA + 加密秘钥 + 管理员密码)) {
+				管理员会话 = await 验证管理员会话(request, env);
+				if (!管理员会话) {
 					return new Response('重定向中...', { status: 302, headers: { 'Location': '/login', 'Cache-Control': 'no-store' } });
 				}
-				return await 处理访问链接管理请求(request, env, host, userID, UA, url);
+				return await 处理访问链接管理请求(request, env, host, userID, UA, url, 管理员会话);
+			}
+			if (访问路径 === 'admin' || 访问路径.startsWith('admin/') || 访问路径 === 'locations') {
+				管理员会话 = await 验证管理员会话(request, env);
+				if (!管理员会话) return new Response('重定向中...', { status: 302, headers: { 'Location': '/login', 'Cache-Control': 'no-store' } });
 			}
 			if (env.KV && typeof env.KV.get === 'function') {
 				const 区分大小写访问路径 = url.pathname.slice(1);
@@ -100,27 +108,12 @@ export default {
 					const params = new URLSearchParams(url.search);
 					params.set('token', await MD5MD5(host + userID));
 					return new Response('重定向中...', { status: 302, headers: { 'Location': `/sub?${params.toString()}` } });
-				} else if (访问路径 === 'login') {//处理登录页面和登录请求
-					const cookies = request.headers.get('Cookie') || '';
-					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					if (authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/admin' } });
+				} else if (访问路径 === 'admin' || 访问路径.startsWith('admin/')) {//安全会话已在上方统一验证
+					if (访问路径 === 'admin/init' && request.method !== 'POST') return 访问错误响应('重置配置必须使用受保护的 POST 请求', 405);
 					if (request.method === 'POST') {
-						const formData = await request.text();
-						const params = new URLSearchParams(formData);
-						const 输入密码 = params.get('password');
-						if (输入密码 === (typeof 管理员密码 === 'string' ? 管理员密码.replace(/[\r\n]/g, '') : 管理员密码)) {
-							// 密码正确，设置cookie并返回成功标记
-							const 响应 = new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-							响应.headers.set('Set-Cookie', `auth=${await MD5MD5(UA + 加密秘钥 + 管理员密码)}; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Strict`);
-							return 响应;
-						}
+						const 安全错误 = await 验证管理员修改请求(request, env, url, 管理员会话, false);
+						if (安全错误) return 安全错误;
 					}
-					return fetch(Pages静态页面 + '/login');
-				} else if (访问路径 === 'admin' || 访问路径.startsWith('admin/')) {//验证cookie后响应管理页面
-					const cookies = request.headers.get('Cookie') || '';
-					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					// 没有cookie或cookie错误，跳转到/login页面
-					if (!authCookie || authCookie !== await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
 					if (访问路径 === 'admin/log.json') {// 读取日志内容
 						const 读取日志内容 = await env.KV.get('log.json') || '[]';
 						return new Response(读取日志内容, { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
@@ -327,9 +320,10 @@ export default {
 					后台响应头.set('Pragma', 'no-cache');
 					后台响应头.set('Expires', '0');
 					return new Response(后台HTML, { status: 原后台响应.status, statusText: 原后台响应.statusText, headers: 后台响应头 });
-				} else if (访问路径 === 'logout' || uuidRegex.test(访问路径)) {//清除cookie并跳转到登录页面
+				} else if (uuidRegex.test(访问路径)) {//兼容旧的 UUID 登出入口
 					const 响应 = new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
-					响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
+					响应.headers.append('Set-Cookie', 'admin_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict');
+					响应.headers.append('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict');
 					return 响应;
 				} else if (访问路径 === 'sub') {//处理订阅请求
 					const 动态访问订阅 = !!访问授权上下文;
@@ -528,9 +522,7 @@ export default {
 						return new Response(订阅内容, { status: 200, headers: responseHeaders });
 					}
 				} else if (访问路径 === 'locations') {//反代locations列表
-					const cookies = request.headers.get('Cookie') || '';
-					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					if (authCookie && authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
+					if (管理员会话) return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
 				} else if (访问路径 === 'robots.txt') return new Response('User-agent: *\nDisallow: /', { status: 200, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
 			} else if (!envUUID) return fetch(Pages静态页面 + '/noKV').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
 		}
@@ -563,10 +555,21 @@ export default {
 	async scheduled(controller, env, ctx) {
 		ctx.waitUntil((async () => {
 			await 确保访问数据库(env);
-			const result = await env.DB.prepare("SELECT DISTINCT country FROM access_links WHERE status = 'active' ORDER BY country LIMIT 20").all();
+			await 清理访问连接租约(env);
+			const countryLimit = Math.min(20, Math.max(1, Number(env.CRON_COUNTRY_BATCH_SIZE) || 8));
+			const healthLimit = Math.min(24, Math.max(1, Number(env.CRON_HEALTH_BATCH_SIZE) || 6));
+			const result = await env.DB.prepare("SELECT DISTINCT country FROM access_links WHERE status = 'active' ORDER BY RANDOM() LIMIT ?1").bind(countryLimit).all();
 			for (const item of result.results || []) {
 				await 同步到期访问PROXYIP数据源(env, { country: item.country });
+				await 检测访问PROXYIP池(env, item.country, healthLimit);
 			}
+			await 检查访问管理通知(env);
+			const now = Date.now();
+			await env.DB.batch([
+				env.DB.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?1 OR (revoked_at IS NOT NULL AND revoked_at <= ?2)').bind(now, now - 7 * 86400000),
+				env.DB.prepare('DELETE FROM access_connection_events WHERE started_at < ?1').bind(now - 30 * 86400000),
+				env.DB.prepare('DELETE FROM audit_logs WHERE created_at < ?1').bind(now - Math.min(365, Math.max(7, Number(env.AUDIT_RETENTION_DAYS) || 90)) * 86400000)
+			]);
 		})());
 	}
 };
@@ -606,6 +609,209 @@ function 访问JSON响应(data, status = 200) {
 	});
 }
 
+function 读取Cookie(request, name) {
+	const encodedName = `${name}=`;
+	for (const part of String(request.headers.get('Cookie') || '').split(';')) {
+		const item = part.trim();
+		if (item.startsWith(encodedName)) return decodeURIComponent(item.slice(encodedName.length));
+	}
+	return '';
+}
+
+function 生成安全随机值(bytesLength = 32) {
+	const bytes = crypto.getRandomValues(new Uint8Array(bytesLength));
+	let binary = '';
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+async function SHA256十六进制(value) {
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(value || '')));
+	return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function 获取请求来源信息(request, env) {
+	const rawIP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || '';
+	const recordIP = !['0', 'false', 'off'].includes(String(env.RECORD_ADMIN_IP ?? 'true').toLowerCase());
+	return { ip: recordIP ? rawIP.slice(0, 80) : '', rawIP, asn: String(request.cf?.asn || '').slice(0, 30) };
+}
+
+function 清理审计摘要(value) {
+	if (value == null) return null;
+	const 敏感字段 = /password|cookie|authorization|token|uuid|secret|key|bot|url/i;
+	const walk = (input, depth = 0) => {
+		if (depth > 4) return '[truncated]';
+		if (Array.isArray(input)) return input.slice(0, 100).map(item => walk(item, depth + 1));
+		if (!input || typeof input !== 'object') return typeof input === 'string' ? input.slice(0, 500) : input;
+		const output = {};
+		for (const [key, child] of Object.entries(input).slice(0, 100)) output[key] = 敏感字段.test(key) ? '[redacted]' : walk(child, depth + 1);
+		return output;
+	};
+	return JSON.stringify(walk(value)).slice(0, 4000);
+}
+
+async function 写入审计日志(env, request, session, action, objectType, objectId, before, after, success = true, error = '') {
+	try {
+		if (!env.DB || typeof env.DB.prepare !== 'function') return;
+		await 确保访问数据库(env);
+		const source = 获取请求来源信息(request, env);
+		await env.DB.prepare(`INSERT INTO audit_logs
+			(created_at, session_id, source_ip, source_asn, action, object_type, object_id, before_summary, after_summary, success, error_message)
+			VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`)
+			.bind(Date.now(), session?.id || null, source.ip || null, source.asn || null, String(action).slice(0, 80), String(objectType).slice(0, 50), String(objectId ?? '').slice(0, 100), 清理审计摘要(before), 清理审计摘要(after), success ? 1 : 0, String(error || '').slice(0, 500)).run();
+	} catch (auditError) {
+		console.error('写入审计日志失败:', auditError);
+	}
+}
+
+async function 获取管理员会话记录(env, tokenHash) {
+	if (env.DB && typeof env.DB.prepare === 'function') {
+		await 确保访问数据库(env);
+		return await env.DB.prepare(`SELECT * FROM admin_sessions
+			WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2 LIMIT 1`).bind(tokenHash, Date.now()).first();
+	}
+	if (env.KV && typeof env.KV.get === 'function') {
+		const value = await env.KV.get(`admin-session:${tokenHash}`, { type: 'json' });
+		return value && !value.revoked_at && Number(value.expires_at) > Date.now() ? value : null;
+	}
+	return null;
+}
+
+async function 验证管理员会话(request, env) {
+	const token = 读取Cookie(request, 'admin_session');
+	if (!token || token.length < 40 || token.length > 200) return null;
+	const tokenHash = await SHA256十六进制(token);
+	const session = await 获取管理员会话记录(env, tokenHash);
+	if (!session) return null;
+	const userAgentHash = await SHA256十六进制(request.headers.get('User-Agent') || '');
+	if (session.user_agent_hash && session.user_agent_hash !== userAgentHash) return null;
+	const now = Date.now();
+	if (now - Number(session.last_seen_at || 0) > 300000) {
+		if (env.DB && typeof env.DB.prepare === 'function') {
+			await env.DB.prepare('UPDATE admin_sessions SET last_seen_at = ?1 WHERE id = ?2').bind(now, session.id).run();
+		} else if (env.KV && typeof env.KV.put === 'function') {
+			session.last_seen_at = now;
+			await env.KV.put(`admin-session:${tokenHash}`, JSON.stringify(session), { expirationTtl: Math.max(60, Math.ceil((Number(session.expires_at) - now) / 1000)) });
+		}
+	}
+	return session;
+}
+
+async function 验证管理员修改请求(request, env, url, session, requireCsrf = true) {
+	if (!session) return 访问错误响应('管理员会话已失效，请重新登录', 401);
+	const origin = request.headers.get('Origin');
+	if (!origin || origin !== url.origin) return 访问错误响应('请求来源校验失败', 403);
+	const fetchSite = (request.headers.get('Sec-Fetch-Site') || '').toLowerCase();
+	if (fetchSite && fetchSite !== 'same-origin') return 访问错误响应('跨站请求已拒绝', 403);
+	if (requireCsrf) {
+		const csrf = request.headers.get('X-CSRF-Token') || '';
+		if (!csrf || csrf !== 读取Cookie(request, 'admin_csrf') || await SHA256十六进制(csrf) !== session.csrf_hash) return 访问错误响应('CSRF 校验失败，请刷新页面后重试', 403);
+	}
+	return null;
+}
+
+function 管理员登录页面() {
+	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理员登录</title><style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#09111f;color:#e8eef9;font:15px system-ui}.box{width:min(92vw,390px);padding:26px;background:#111c2e;border:1px solid #2a3b59;border-radius:16px;box-shadow:0 20px 60px #0006}h1{font-size:22px;margin:0 0 18px}label{display:block;color:#a7b3c8;margin-bottom:6px}input,button{width:100%;font:inherit;border-radius:9px;padding:11px}input{background:#091425;color:#fff;border:1px solid #405273}button{margin-top:14px;border:0;background:#4f8cff;color:#fff;cursor:pointer}.msg{min-height:24px;color:#ff91a1;margin-top:10px}</style></head><body><form class="box" id="login"><h1>管理员登录</h1><label for="password">ADMIN 密码</label><input id="password" name="password" type="password" autocomplete="current-password" required autofocus><button>登录</button><div class="msg" id="msg" role="alert"></div></form><script>document.querySelector('#login').addEventListener('submit',async e=>{e.preventDefault();const b=e.submitter,m=document.querySelector('#msg');b.disabled=true;m.textContent='';try{const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(e.target))});const j=await r.json().catch(()=>({success:false}));if(!r.ok||!j.success)throw new Error(j.error||'登录失败，请稍后重试');location.href='/admin'}catch(x){m.textContent=x.message}finally{b.disabled=false}})</script></body></html>`;
+}
+
+async function 读取登录限制(env, ipHash) {
+	if (env.DB && typeof env.DB.prepare === 'function') {
+		await 确保访问数据库(env);
+		return await env.DB.prepare('SELECT * FROM admin_login_attempts WHERE ip_hash = ?1').bind(ipHash).first();
+	}
+	if (env.KV && typeof env.KV.get === 'function') return await env.KV.get(`admin-login:${ipHash}`, { type: 'json' });
+	return null;
+}
+
+async function 写入登录限制(env, ipHash, record) {
+	if (env.DB && typeof env.DB.prepare === 'function') {
+		await env.DB.prepare(`INSERT INTO admin_login_attempts(ip_hash, window_started_at, failure_count, blocked_until, last_attempt_at)
+			VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(ip_hash) DO UPDATE SET window_started_at = ?2,
+			failure_count = ?3, blocked_until = ?4, last_attempt_at = ?5`)
+			.bind(ipHash, record.window_started_at, record.failure_count, record.blocked_until || null, record.last_attempt_at).run();
+	} else if (env.KV && typeof env.KV.put === 'function') await env.KV.put(`admin-login:${ipHash}`, JSON.stringify(record), { expirationTtl: 3600 });
+}
+
+async function 创建管理员会话(env, request) {
+	const token = 生成安全随机值(32), csrf = 生成安全随机值(24), id = crypto.randomUUID();
+	const now = Date.now(), ttlSeconds = Math.min(604800, Math.max(900, Number(env.ADMIN_SESSION_TTL_SECONDS) || 86400));
+	const source = 获取请求来源信息(request, env);
+	const record = { id, token_hash: await SHA256十六进制(token), csrf_hash: await SHA256十六进制(csrf), created_at: now, expires_at: now + ttlSeconds * 1000, last_seen_at: now, source_ip: source.ip || null, source_asn: source.asn || null, user_agent_hash: await SHA256十六进制(request.headers.get('User-Agent') || ''), revoked_at: null };
+	if (env.DB && typeof env.DB.prepare === 'function') {
+		await env.DB.prepare(`INSERT INTO admin_sessions(id, token_hash, csrf_hash, created_at, expires_at, last_seen_at, source_ip, source_asn, user_agent_hash)
+			VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`).bind(record.id, record.token_hash, record.csrf_hash, record.created_at, record.expires_at, record.last_seen_at, record.source_ip, record.source_asn, record.user_agent_hash).run();
+	} else if (env.KV && typeof env.KV.put === 'function') await env.KV.put(`admin-session:${record.token_hash}`, JSON.stringify(record), { expirationTtl: ttlSeconds });
+	else throw new Error('安全管理员会话需要绑定 DB 或 KV');
+	return { token, csrf, record, ttlSeconds };
+}
+
+async function 处理管理员登录请求(request, env, url, adminPassword) {
+	if (request.method === 'GET' || request.method === 'HEAD') {
+		if (await 验证管理员会话(request, env)) return Response.redirect(`${url.origin}/admin`, 302);
+		return new Response(request.method === 'HEAD' ? null : 管理员登录页面(), { status: 200, headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'", 'Referrer-Policy': 'no-referrer' } });
+	}
+	if (request.method !== 'POST') return 访问错误响应('不支持的请求方法', 405);
+	const origin = request.headers.get('Origin');
+	if (!origin || origin !== url.origin) return 访问错误响应('登录失败，请稍后重试', 403);
+	const source = 获取请求来源信息(request, env);
+	const ipHash = await SHA256十六进制(source.rawIP || 'unknown');
+	const now = Date.now(), windowMs = 10 * 60 * 1000, threshold = Math.min(20, Math.max(3, Number(env.ADMIN_LOGIN_MAX_FAILURES) || 5)), blockMs = Math.min(3600000, Math.max(60000, Number(env.ADMIN_LOGIN_BLOCK_SECONDS) * 1000 || 15 * 60 * 1000));
+	let attempt = await 读取登录限制(env, ipHash) || { window_started_at: now, failure_count: 0, blocked_until: null, last_attempt_at: now };
+	if (Number(attempt.blocked_until || 0) > now) {
+		await 写入审计日志(env, request, null, 'admin.login.failed', 'admin_session', '', null, { reason: 'rate_limited' }, false, '统一认证失败');
+		return 访问错误响应('登录失败，请稍后重试', 429);
+	}
+	if (now - Number(attempt.window_started_at || 0) > windowMs) attempt = { window_started_at: now, failure_count: 0, blocked_until: null, last_attempt_at: now };
+	let inputPassword = '';
+	try {
+		const contentType = request.headers.get('Content-Type') || '';
+		if (!contentType.includes('application/x-www-form-urlencoded') && !contentType.includes('multipart/form-data')) throw new Error('invalid content type');
+		const form = await request.formData();
+		inputPassword = String(form.get('password') || '').replace(/[\r\n]/g, '');
+	} catch (_) { }
+	const passwordMatches = adminPassword && inputPassword.length === adminPassword.length && await 安全比较文本(inputPassword, adminPassword);
+	if (!passwordMatches) {
+		attempt = 计算登录失败状态(attempt, now, threshold, blockMs);
+		await 写入登录限制(env, ipHash, attempt);
+		await 写入审计日志(env, request, null, 'admin.login.failed', 'admin_session', '', null, { reason: 'invalid_credentials' }, false, '统一认证失败');
+		return 访问错误响应('登录失败，请稍后重试', attempt.blocked_until ? 429 : 401);
+	}
+	const created = await 创建管理员会话(env, request);
+	await 写入登录限制(env, ipHash, { window_started_at: now, failure_count: 0, blocked_until: null, last_attempt_at: now });
+	await 写入审计日志(env, request, created.record, 'admin.login.success', 'admin_session', created.record.id, null, { expires_at: created.record.expires_at }, true);
+	const response = 访问JSON响应({ success: true });
+	response.headers.append('Set-Cookie', `admin_session=${encodeURIComponent(created.token)}; Path=/; Max-Age=${created.ttlSeconds}; HttpOnly; Secure; SameSite=Strict`);
+	response.headers.append('Set-Cookie', `admin_csrf=${encodeURIComponent(created.csrf)}; Path=/; Max-Age=${created.ttlSeconds}; Secure; SameSite=Strict`);
+	response.headers.append('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict');
+	return response;
+}
+
+async function 安全比较文本(a, b) {
+	const [left, right] = await Promise.all([SHA256十六进制(a), SHA256十六进制(b)]);
+	let diff = left.length ^ right.length;
+	for (let i = 0; i < Math.max(left.length, right.length); i++) diff |= (left.charCodeAt(i) || 0) ^ (right.charCodeAt(i) || 0);
+	return diff === 0;
+}
+
+async function 处理管理员单会话退出(request, env, url) {
+	const token = 读取Cookie(request, 'admin_session');
+	// 退出本机会话应按 token hash 撤销，即使 User-Agent 已变化也不能留下可用会话。
+	const session = token && token.length >= 40 && token.length <= 200
+		? await 获取管理员会话记录(env, await SHA256十六进制(token))
+		: null;
+	if (session && token) {
+		const tokenHash = await SHA256十六进制(token);
+		if (env.DB && typeof env.DB.prepare === 'function') await env.DB.prepare('UPDATE admin_sessions SET revoked_at = ?1 WHERE id = ?2').bind(Date.now(), session.id).run();
+		else if (env.KV && typeof env.KV.delete === 'function') await env.KV.delete(`admin-session:${tokenHash}`);
+		await 写入审计日志(env, request, session, 'admin.logout', 'admin_session', session.id, null, null, true);
+	}
+	const response = new Response('重定向中...', { status: 302, headers: { Location: `${url.origin}/login`, 'Cache-Control': 'no-store' } });
+	response.headers.append('Set-Cookie', 'admin_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict');
+	response.headers.append('Set-Cookie', 'admin_csrf=; Path=/; Max-Age=0; Secure; SameSite=Strict');
+	response.headers.append('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict');
+	return response;
+}
+
 async function 确保访问数据库(env) {
 	if (!env.DB || typeof env.DB.prepare !== 'function') throw new Error('请先绑定名为 DB 的 D1 数据库');
 	if (!访问数据库初始化任务) {
@@ -623,7 +829,17 @@ async function 确保访问数据库(env) {
 				created_at INTEGER NOT NULL,
 				first_used_at INTEGER,
 				expires_at INTEGER,
-				last_used_at INTEGER
+				last_used_at INTEGER,
+				connection_count INTEGER NOT NULL DEFAULT 0,
+				active_connections INTEGER NOT NULL DEFAULT 0,
+				last_client_ip TEXT,
+				last_client_asn TEXT,
+				max_concurrent_connections INTEGER NOT NULL DEFAULT 0,
+				max_total_connections INTEGER NOT NULL DEFAULT 0,
+				bind_first_ip INTEGER NOT NULL DEFAULT 0,
+				bound_ip TEXT,
+				tags TEXT NOT NULL DEFAULT '',
+				connection_epoch INTEGER NOT NULL DEFAULT 0
 				)`),
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_links_status_expires ON access_links(status, expires_at)'),
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_links_country ON access_links(country)'),
@@ -657,12 +873,55 @@ async function 确保访问数据库(env) {
 					last_error TEXT NOT NULL DEFAULT '',
 					PRIMARY KEY(source_id, country)
 				)`),
-				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_country_enabled ON proxy_ip_pool(country, enabled)')
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_country_enabled ON proxy_ip_pool(country, enabled)'),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS access_connection_leases (
+					id TEXT PRIMARY KEY, access_link_id INTEGER NOT NULL, proxy_ip TEXT, created_at INTEGER NOT NULL,
+					heartbeat_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_connection_leases_link ON access_connection_leases(access_link_id)'),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_connection_leases_expiry ON access_connection_leases(expires_at)'),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS access_connection_events (
+					id INTEGER PRIMARY KEY AUTOINCREMENT, access_link_id INTEGER NOT NULL, proxy_ip TEXT,
+					started_at INTEGER NOT NULL, ended_at INTEGER, success INTEGER, error_code TEXT NOT NULL DEFAULT '')`),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_connection_events_started ON access_connection_events(started_at)'),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS country_health_config (
+					country TEXT PRIMARY KEY, min_healthy_ips INTEGER NOT NULL DEFAULT 3, updated_at INTEGER NOT NULL)`),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS admin_sessions (
+					id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, csrf_hash TEXT NOT NULL, created_at INTEGER NOT NULL,
+					expires_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, source_ip TEXT, source_asn TEXT,
+					user_agent_hash TEXT NOT NULL, revoked_at INTEGER)`),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS admin_login_attempts (
+					ip_hash TEXT PRIMARY KEY, window_started_at INTEGER NOT NULL, failure_count INTEGER NOT NULL DEFAULT 0,
+					blocked_until INTEGER, last_attempt_at INTEGER NOT NULL)`),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS audit_logs (
+					id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL, session_id TEXT, source_ip TEXT,
+					source_asn TEXT, action TEXT NOT NULL, object_type TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '',
+					before_summary TEXT, after_summary TEXT, success INTEGER NOT NULL, error_message TEXT NOT NULL DEFAULT '')`),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC)'),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS notification_state (
+					event_key TEXT PRIMARY KEY, last_payload_hash TEXT NOT NULL, last_sent_at INTEGER NOT NULL, cooldown_until INTEGER NOT NULL)`),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS schema_metadata (
+					key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)`)
 			]);
 
-			const 列结果 = await env.DB.prepare('PRAGMA table_info(proxy_ip_pool)').all();
-			const 已有列 = new Set((列结果.results || []).map(item => item.name));
-			const 新列 = [
+			// 迁移文件是正式升级路径；以下检查仅为旧版“首次访问自动建表”部署保留兼容性。
+			const 补充缺失列 = async (table, columns) => {
+				const result = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
+				const existing = new Set((result.results || []).map(item => item.name));
+				for (const [name, definition] of columns) if (!existing.has(name)) await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`).run();
+			};
+			await 补充缺失列('access_links', [
+				['connection_count', 'INTEGER NOT NULL DEFAULT 0'],
+				['active_connections', 'INTEGER NOT NULL DEFAULT 0'],
+				['last_client_ip', 'TEXT'],
+				['last_client_asn', 'TEXT'],
+				['max_concurrent_connections', 'INTEGER NOT NULL DEFAULT 0'],
+				['max_total_connections', 'INTEGER NOT NULL DEFAULT 0'],
+				['bind_first_ip', 'INTEGER NOT NULL DEFAULT 0'],
+				['bound_ip', 'TEXT'],
+				['tags', "TEXT NOT NULL DEFAULT ''"],
+				['connection_epoch', 'INTEGER NOT NULL DEFAULT 0']
+			]);
+			await 补充缺失列('proxy_ip_pool', [
 				['source_id', 'INTEGER'],
 				['health_status', "TEXT NOT NULL DEFAULT 'unknown'"],
 				['latency_ms', 'INTEGER'],
@@ -670,14 +929,22 @@ async function 确保访问数据库(env) {
 				['last_checked_at', 'INTEGER'],
 				['last_success_at', 'INTEGER'],
 				['last_error', "TEXT NOT NULL DEFAULT ''"],
-				['updated_at', 'INTEGER NOT NULL DEFAULT 0']
-			];
-			for (const [列名, 定义] of 新列) {
-				if (!已有列.has(列名)) await env.DB.prepare(`ALTER TABLE proxy_ip_pool ADD COLUMN ${列名} ${定义}`).run();
-			}
+				['updated_at', 'INTEGER NOT NULL DEFAULT 0'],
+				['health_score', 'INTEGER NOT NULL DEFAULT 50'],
+				['consecutive_failures', 'INTEGER NOT NULL DEFAULT 0'],
+				['cooldown_until', 'INTEGER'],
+				['real_success_count', 'INTEGER NOT NULL DEFAULT 0'],
+				['real_failure_count', 'INTEGER NOT NULL DEFAULT 0'],
+				['last_real_failure', 'INTEGER']
+			]);
+			await 补充缺失列('proxy_ip_sources', [['consecutive_failures', 'INTEGER NOT NULL DEFAULT 0']]);
 			await env.DB.batch([
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_source ON proxy_ip_pool(source_id)'),
-				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_health ON proxy_ip_pool(country, enabled, health_status, failure_count)')
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_health ON proxy_ip_pool(country, enabled, health_status, failure_count)'),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_score ON proxy_ip_pool(country, enabled, cooldown_until, health_score)'),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_links_tags ON access_links(tags)'),
+				env.DB.prepare(`INSERT INTO schema_metadata(key, value, updated_at) VALUES ('access_management_schema', '5', ?1)
+					ON CONFLICT(key) DO UPDATE SET value = '5', updated_at = ?1`).bind(Date.now())
 			]);
 			const now = Date.now();
 			await env.DB.prepare(`INSERT OR IGNORE INTO proxy_ip_sources
@@ -708,8 +975,34 @@ function 获取访问记录状态错误(记录, now = Date.now()) {
 	return null;
 }
 
-function 创建访问授权上下文(env, 记录) {
-	return { env, 记录, 激活任务: null, 反代上下文: null, 到期定时器: null, 到期关闭函数: null };
+function 创建访问授权上下文(env, 记录, request = null) {
+	const rawIP = request ? (request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || '') : '';
+	const recordClientIP = !['0', 'false', 'off'].includes(String(env.RECORD_CLIENT_IP ?? 'false').toLowerCase());
+	return {
+		env, 记录, request, clientIP: rawIP.slice(0, 80), clientASN: String(request?.cf?.asn || '').slice(0, 30),
+		recordClientIP, 激活任务: null, 释放任务: null, 反代上下文: null, leaseId: null, eventId: null,
+		监控定时器: null, 到期关闭函数: null, 已释放: false, 代理结果已记录: false, 代理连接成功: false
+	};
+}
+
+function 访问限制错误(记录, clientIP, now = Date.now()) {
+	const statusError = 获取访问记录状态错误(记录, now);
+	if (statusError) return statusError;
+	if (Number(记录.bind_first_ip) === 1 && 记录.bound_ip && 记录.bound_ip !== clientIP) return { status: 403, message: '访问链接已绑定其他客户端 IP' };
+	if (Number(记录.max_total_connections) > 0 && Number(记录.connection_count) >= Number(记录.max_total_connections)) return { status: 429, message: '访问链接累计连接次数已达到上限' };
+	if (Number(记录.max_concurrent_connections) > 0 && Number(记录.active_connections) >= Number(记录.max_concurrent_connections)) return { status: 429, message: '访问链接当前连接数已达到并发上限' };
+	return null;
+}
+
+async function 查询健康访问代理候选(session, country, currentProxy, now = Date.now()) {
+	return await session.prepare(`SELECT * FROM proxy_ip_pool
+		WHERE country = ?1 AND enabled = 1
+			AND (cooldown_until IS NULL OR cooldown_until <= ?3)
+			AND (health_status <> 'unhealthy' OR cooldown_until <= ?3)
+		ORDER BY CASE WHEN proxy_ip = ?2 THEN 0 ELSE 1 END,
+			CASE health_status WHEN 'healthy' THEN 0 ELSE 1 END,
+			health_score DESC, consecutive_failures ASC, latency_ms ASC, RANDOM() LIMIT 8`)
+		.bind(country, currentProxy || '', now).all();
 }
 
 async function 激活访问授权上下文(上下文) {
@@ -719,67 +1012,146 @@ async function 激活访问授权上下文(上下文) {
 		await 确保访问数据库(上下文.env);
 		const session = 获取访问数据库会话(上下文.env);
 		let 记录 = await session.prepare('SELECT * FROM access_links WHERE token = ?1 LIMIT 1').bind(上下文.记录.token).first();
-		const 读取错误 = 获取访问记录状态错误(记录);
+		if (记录) {
+			const now = Date.now();
+			await 上下文.env.DB.batch([
+				session.prepare('DELETE FROM access_connection_leases WHERE access_link_id = ?1 AND expires_at <= ?2').bind(记录.id, now),
+				session.prepare(`UPDATE access_links SET active_connections = (
+					SELECT COUNT(*) FROM access_connection_leases WHERE access_link_id = ?1
+				) WHERE id = ?1`).bind(记录.id)
+			]);
+			记录 = await session.prepare('SELECT * FROM access_links WHERE id = ?1').bind(记录.id).first();
+		}
+		const 读取错误 = 访问限制错误(记录, 上下文.clientIP);
 		if (读取错误) throw Object.assign(new Error(读取错误.message), { status: 读取错误.status });
 
-		const 查询候选 = () => session.prepare(`SELECT proxy_ip FROM proxy_ip_pool
-			WHERE country = ?1 AND enabled = 1 AND health_status <> 'unhealthy'
-			ORDER BY CASE WHEN proxy_ip = ?2 THEN 0 ELSE 1 END,
-				CASE health_status WHEN 'healthy' THEN 0 ELSE 1 END,
-				failure_count ASC, latency_ms ASC, RANDOM() LIMIT 8`).bind(记录.country, 记录.proxy_ip || '').all();
-		let IP结果 = await 查询候选();
+		let IP结果 = await 查询健康访问代理候选(session, 记录.country, 记录.proxy_ip);
 		if (!(IP结果.results || []).length) {
 			await 同步到期访问PROXYIP数据源(上下文.env, { country: 记录.country });
-			IP结果 = await 查询候选();
+			IP结果 = await 查询健康访问代理候选(session, 记录.country, 记录.proxy_ip);
 		}
 		const 候选反代IP = (IP结果.results || []).map(item => item.proxy_ip);
 		const 选定反代IP = 候选反代IP[0] || null;
-		if (!选定反代IP) throw Object.assign(new Error(`国家 ${记录.country} 暂无可用 PROXYIP`), { status: 503 });
+		if (!选定反代IP) throw Object.assign(new Error(`国家 ${记录.country} 暂无健康且未隔离的 PROXYIP`), { status: 503 });
 
-		const now = Date.now();
-		await session.prepare(`UPDATE access_links
-			SET proxy_ip = COALESCE(proxy_ip, ?1),
-				first_used_at = COALESCE(first_used_at, ?2),
-				expires_at = CASE WHEN duration_seconds = 0 THEN NULL ELSE COALESCE(expires_at, ?2 + duration_seconds * 1000) END,
-				last_used_at = ?2
-			WHERE token = ?3 AND status = 'active' AND (expires_at IS NULL OR expires_at > ?2)`)
-			.bind(选定反代IP, now, 记录.token).run();
+		const now = Date.now(), 原反代IP = 记录.proxy_ip || null, leaseExpiresAt = now + 90000;
+		上下文.leaseId = crypto.randomUUID();
+		const [admission, update] = await 上下文.env.DB.batch([
+			session.prepare(`INSERT INTO access_connection_leases(id, access_link_id, proxy_ip, created_at, heartbeat_at, expires_at)
+				SELECT ?1, id, ?2, ?3, ?3, ?4 FROM access_links
+				WHERE token = ?5 AND status = 'active' AND (expires_at IS NULL OR expires_at > ?3)
+					AND (max_total_connections = 0 OR connection_count < max_total_connections)
+					AND (max_concurrent_connections = 0 OR active_connections < max_concurrent_connections)
+					AND (bind_first_ip = 0 OR bound_ip IS NULL OR bound_ip = ?6)`)
+				.bind(上下文.leaseId, 选定反代IP, now, leaseExpiresAt, 记录.token, 上下文.clientIP || ''),
+			session.prepare(`UPDATE access_links SET
+			proxy_ip = ?1,
+			first_used_at = COALESCE(first_used_at, ?2),
+			expires_at = CASE WHEN duration_seconds = 0 THEN NULL ELSE COALESCE(expires_at, ?2 + duration_seconds * 1000) END,
+			last_used_at = ?2,
+			connection_count = connection_count + 1,
+			active_connections = active_connections + 1,
+			last_client_ip = ?3,
+			last_client_asn = ?4,
+			bound_ip = CASE WHEN bind_first_ip = 1 THEN COALESCE(bound_ip, ?5) ELSE bound_ip END
+			WHERE token = ?6 AND EXISTS (SELECT 1 FROM access_connection_leases WHERE id = ?7)`)
+				.bind(选定反代IP, now, 上下文.recordClientIP ? 上下文.clientIP || null : null, 上下文.clientASN || null, 上下文.clientIP || '', 记录.token, 上下文.leaseId)
+		]);
+		if (!Number(admission?.meta?.changes || 0) || !Number(update?.meta?.changes || 0)) {
+			if (Number(admission?.meta?.changes || 0)) await session.prepare('DELETE FROM access_connection_leases WHERE id = ?1').bind(上下文.leaseId).run();
+			上下文.leaseId = null;
+			记录 = await session.prepare('SELECT * FROM access_links WHERE token = ?1 LIMIT 1').bind(记录.token).first();
+			const 限制错误 = 访问限制错误(记录, 上下文.clientIP, now) || { status: 409, message: '访问链接状态已变化，请重试' };
+			throw Object.assign(new Error(限制错误.message), { status: 限制错误.status });
+		}
+
 		记录 = await session.prepare('SELECT * FROM access_links WHERE token = ?1 LIMIT 1').bind(记录.token).first();
-		const 更新错误 = 获取访问记录状态错误(记录, now);
-		if (更新错误) throw Object.assign(new Error(更新错误.message), { status: 更新错误.status });
+		try {
+			const event = await session.prepare(`INSERT INTO access_connection_events(access_link_id, proxy_ip, started_at)
+				VALUES (?1, ?2, ?3)`).bind(记录.id, 记录.proxy_ip, now).run();
+			上下文.eventId = event?.meta?.last_row_id || null;
+		} catch (error) {
+			await 上下文.env.DB.batch([
+				session.prepare('DELETE FROM access_connection_leases WHERE id = ?1').bind(上下文.leaseId),
+				session.prepare(`UPDATE access_links SET active_connections = (
+					SELECT COUNT(*) FROM access_connection_leases WHERE access_link_id = ?1
+				) WHERE id = ?1`).bind(记录.id)
+			]);
+			throw error;
+		}
 
 		上下文.记录 = 记录;
+		上下文.connectionEpoch = Number(记录.connection_epoch || 0);
 		上下文.反代上下文 = {
-			反代IP: 候选反代IP.join(','),
+			反代IP: [记录.proxy_ip, ...候选反代IP.filter(item => item !== 记录.proxy_ip)].join(','),
 			启用反代兜底: false,
 			启用SOCKS5反代: null,
 			启用SOCKS5全局反代: false,
-			parsedSocks5Address: {}
+			parsedSocks5Address: {},
+			访问授权上下文: 上下文
 		};
+		if (!本实例活动访问连接.has(记录.id)) 本实例活动访问连接.set(记录.id, new Set());
+		本实例活动访问连接.get(记录.id).add(上下文);
+		if (原反代IP && 原反代IP !== 记录.proxy_ip) await 写入审计日志(上下文.env, 上下文.request, null, 'access.auto_failover', 'access_link', 记录.id, { proxy_ip: 原反代IP }, { proxy_ip: 记录.proxy_ip }, true);
 		return 记录;
 	})();
 	return await 上下文.激活任务;
 }
 
+async function 结束访问授权上下文(上下文, success = null, errorCode = '') {
+	if (!上下文 || 上下文.已释放) return;
+	上下文.已释放 = true;
+	if (上下文.监控定时器) clearTimeout(上下文.监控定时器);
+	const set = 本实例活动访问连接.get(上下文.记录?.id);
+	if (set) { set.delete(上下文); if (!set.size) 本实例活动访问连接.delete(上下文.记录.id); }
+	if (!上下文.leaseId) return;
+	上下文.释放任务 = (async () => {
+		try {
+			const session = 获取访问数据库会话(上下文.env), now = Date.now();
+			const statements = [
+				session.prepare('DELETE FROM access_connection_leases WHERE id = ?1').bind(上下文.leaseId),
+				session.prepare(`UPDATE access_links SET active_connections = (
+					SELECT COUNT(*) FROM access_connection_leases WHERE access_link_id = ?1
+				) WHERE id = ?1`).bind(上下文.记录.id)
+			];
+			if (上下文.eventId) statements.push(session.prepare(`UPDATE access_connection_events SET ended_at = ?1, success = ?2, error_code = ?3 WHERE id = ?4`)
+				.bind(now, success == null ? (上下文.代理连接成功 ? 1 : 0) : (success ? 1 : 0), String(errorCode || '').slice(0, 80), 上下文.eventId));
+			await 上下文.env.DB.batch(statements);
+		} catch (error) { console.error('释放访问连接计数失败:', error); }
+	})();
+	return await 上下文.释放任务;
+}
+
 function 安排访问链接到期(上下文, 关闭函数) {
-	if (!上下文?.记录?.expires_at || typeof 关闭函数 !== 'function') return null;
+	if (!上下文 || typeof 关闭函数 !== 'function') return null;
 	上下文.到期关闭函数 = 关闭函数;
-	if (上下文.到期定时器) return 上下文.到期定时器;
-	const 安排 = () => {
-		const 剩余毫秒 = Number(上下文.记录.expires_at) - Date.now();
-		if (剩余毫秒 <= 0) {
-			try { 上下文.到期关闭函数() } catch (_) { }
-			return null;
-		}
-		上下文.到期定时器 = setTimeout(() => {
-			上下文.到期定时器 = null;
-			if (Number(上下文.记录.expires_at) <= Date.now()) {
+	if (上下文.监控定时器 || 上下文.已释放) return 上下文.监控定时器;
+	const intervalMs = Math.min(60000, Math.max(10000, Number(上下文.env.ACCESS_STATUS_CHECK_SECONDS) * 1000 || 30000));
+	const check = async () => {
+		if (上下文.已释放) return;
+		try {
+			const now = Date.now(), session = 获取访问数据库会话(上下文.env);
+			await session.prepare('UPDATE access_connection_leases SET heartbeat_at = ?1, expires_at = ?2 WHERE id = ?3').bind(now, now + Math.max(90000, intervalMs * 3), 上下文.leaseId).run();
+			const current = await session.prepare('SELECT status, expires_at, connection_epoch FROM access_links WHERE id = ?1').bind(上下文.记录.id).first();
+			const error = 获取访问记录状态错误(current, now) || (Number(current?.connection_epoch || 0) !== Number(上下文.connectionEpoch || 0) ? { status: 409, message: '访问链接计时已重置' } : null);
+			if (error) {
 				try { 上下文.到期关闭函数() } catch (_) { }
-			} else 安排();
-		}, Math.min(剩余毫秒, 2147483647));
-		return 上下文.到期定时器;
+				await 结束访问授权上下文(上下文, false, error.status === 410 ? 'expired' : 'disabled');
+				return;
+			}
+		} catch (error) { console.error('检查访问连接状态失败:', error); }
+		if (!上下文.已释放) 上下文.监控定时器 = setTimeout(check, intervalMs);
 	};
-	return 安排();
+	const expiresIn = 上下文.记录?.expires_at ? Math.max(0, Number(上下文.记录.expires_at) - Date.now()) : intervalMs;
+	上下文.监控定时器 = setTimeout(check, Math.min(intervalMs, expiresIn || 1));
+	return 上下文.监控定时器;
+}
+
+function 关闭本实例链接连接(linkId) {
+	for (const context of 本实例活动访问连接.get(Number(linkId)) || []) {
+		try { context.到期关闭函数?.() } catch (_) { }
+		结束访问授权上下文(context, false, 'disabled');
+	}
 }
 
 function 生成随机访问令牌() {
@@ -875,8 +1247,48 @@ function 标准化访问数据源URL(value) {
 	try { url = new URL(String(value || '').trim()); } catch (_) { throw new Error('数据源 URL 格式不正确'); }
 	if (url.protocol !== 'https:' || url.username || url.password || url.href.length > 2000) throw new Error('数据源必须使用不含账号密码的 HTTPS URL');
 	const hostname = url.hostname.toLowerCase();
-	if (hostname === 'localhost' || hostname.endsWith('.local') || /^127\./.test(hostname) || /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^169\.254\./.test(hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) || /^\[(?:::1|f[cd]|fe8)/i.test(hostname)) throw new Error('数据源地址不允许指向本地或私有网络');
+	if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') || hostname.endsWith('.internal') || /^127\./.test(hostname) || /^0\./.test(hostname) || /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^169\.254\./.test(hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) || /^100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])\./.test(hostname) || /^198\.(?:1[89])\./.test(hostname) || /^(?:22[4-9]|23\d)\./.test(hostname) || /^(?:\[)?(?:::?\]?$$|::1|f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:|ff[0-9a-f]{2}:|::ffff:(?:127|10|192\.168|169\.254|172\.(?:1[6-9]|2\d|3[01])))/i.test(hostname)) throw new Error('数据源地址不允许指向本地或私有网络');
 	return url.href;
+}
+
+async function 安全获取访问数据源(url, options, maximumBytes, allowedContentTypes) {
+	let current = 标准化访问数据源URL(url);
+	for (let redirectCount = 0; redirectCount <= 3; redirectCount++) {
+		const response = await fetch(current, { ...options, redirect: 'manual' });
+		if ([301, 302, 303, 307, 308].includes(response.status)) {
+			if (redirectCount >= 3) throw new Error('数据源重定向次数过多');
+			const location = response.headers.get('Location');
+			if (!location) throw new Error('数据源重定向缺少 Location');
+			current = 标准化访问数据源URL(new URL(location, current).href);
+			continue;
+		}
+		if (!response.ok) throw new Error(`数据源返回 HTTP ${response.status}`);
+		const contentLength = Number(response.headers.get('content-length') || 0);
+		if (contentLength > maximumBytes) throw new Error(`数据源内容超过 ${Math.round(maximumBytes / 1048576)}MB`);
+		const contentType = (response.headers.get('content-type') || '').toLowerCase().split(';')[0].trim();
+		if (contentType && !allowedContentTypes.some(type => contentType === type || contentType.startsWith(type))) throw new Error(`数据源 Content-Type 不受支持：${contentType}`);
+		return response;
+	}
+	throw new Error('数据源重定向失败');
+}
+
+async function 读取受限响应字节(response, maximumBytes) {
+	if (!response.body) return new Uint8Array(0);
+	const reader = response.body.getReader(), chunks = [];
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > maximumBytes) throw new Error(`数据源内容超过 ${Math.round(maximumBytes / 1048576)}MB`);
+			chunks.push(value);
+		}
+	} finally { try { reader.releaseLock() } catch (_) { } }
+	const output = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.byteLength; }
+	return output;
 }
 
 function 解析访问PROXYIP数据源(text, defaultCountry = '') {
@@ -1026,12 +1438,9 @@ async function 获取访问PROXYIP数据源内容(source, targetCountry = '') {
 	try {
 		if (source.url === 内置访问PROXYIP数据源URL && targetCountry) {
 			const zipUrl = source.url.replace(/\/all\.json$/i, '/ip.zip');
-			const response = await fetch(zipUrl, { headers: { Accept: 'application/zip,*/*;q=0.1', 'User-Agent': 'edgetunnel-proxy-pool/1.0' }, signal: controller.signal, redirect: 'follow' });
-			if (!response.ok) throw new Error(`数据源返回 HTTP ${response.status}`);
-			const contentLength = Number(response.headers.get('content-length') || 0);
-			if (contentLength > 20 * 1024 * 1024) throw new Error('数据源内容超过 20MB');
-			const buffer = await response.arrayBuffer();
-			if (buffer.byteLength > 20 * 1024 * 1024) throw new Error('数据源内容超过 20MB');
+			const response = await 安全获取访问数据源(zipUrl, { headers: { Accept: 'application/zip,*/*;q=0.1', 'User-Agent': 'edgetunnel-proxy-pool/1.0' }, signal: controller.signal }, 20 * 1024 * 1024, ['application/zip', 'application/x-zip-compressed', 'application/octet-stream', 'binary/octet-stream']);
+			const bytes = await 读取受限响应字节(response, 20 * 1024 * 1024);
+			const buffer = bytes.buffer;
 			const ports = [443, 8443, 2053, 2083, 2087, 2096];
 			const names = ports.map(port => `${port}/${targetCountry}.txt`);
 			const files = await 解压访问PROXYIPZIP条目(buffer, names);
@@ -1043,12 +1452,8 @@ async function 获取访问PROXYIP数据源内容(source, targetCountry = '') {
 			}
 			return parts.join('\n');
 		}
-		const response = await fetch(source.url, { headers: { Accept: 'application/json,text/plain,text/csv;q=0.9,*/*;q=0.1', 'User-Agent': 'edgetunnel-proxy-pool/1.0' }, signal: controller.signal, redirect: 'follow' });
-		if (!response.ok) throw new Error(`数据源返回 HTTP ${response.status}`);
-		const contentLength = Number(response.headers.get('content-length') || 0);
-		if (contentLength > 20 * 1024 * 1024) throw new Error('数据源内容超过 20MB');
-		const text = await response.text();
-		if (text.length > 20 * 1024 * 1024) throw new Error('数据源内容超过 20MB');
+		const response = await 安全获取访问数据源(source.url, { headers: { Accept: 'application/json,text/plain,text/csv;q=0.9,*/*;q=0.1', 'User-Agent': 'edgetunnel-proxy-pool/1.0' }, signal: controller.signal }, 20 * 1024 * 1024, ['application/json', 'text/', 'application/csv', 'application/octet-stream']);
+		const text = new TextDecoder().decode(await 读取受限响应字节(response, 20 * 1024 * 1024));
 		return text;
 	} catch (error) {
 		if (error?.name === 'AbortError') throw new Error('数据源请求超时');
@@ -1087,16 +1492,17 @@ async function 同步单个访问PROXYIP数据源(env, source, targetCountry = '
 		await env.DB.batch([
 			删除过期语句,
 			同步记录语句,
-			env.DB.prepare("UPDATE proxy_ip_sources SET last_synced_at = ?1, last_status = 'success', last_error = '', updated_at = ?1 WHERE id = ?2").bind(now, source.id)
+			env.DB.prepare("UPDATE proxy_ip_sources SET last_synced_at = ?1, last_status = 'success', last_error = '', consecutive_failures = 0, updated_at = ?1 WHERE id = ?2").bind(now, source.id)
 		]);
 		return { id: source.id, name: source.name, success: true, imported: entries.length, countries: grouped.size, skipped: parsed.skipped };
 	} catch (error) {
 		const message = String(error?.message || error).slice(0, 300);
-		const statements = [env.DB.prepare("UPDATE proxy_ip_sources SET last_synced_at = ?1, last_status = 'error', last_error = ?2, updated_at = ?1 WHERE id = ?3").bind(now, message, source.id)];
+		const statements = [env.DB.prepare("UPDATE proxy_ip_sources SET last_synced_at = ?1, last_status = 'error', last_error = ?2, consecutive_failures = consecutive_failures + 1, updated_at = ?1 WHERE id = ?3").bind(now, message, source.id)];
 		if (targetCountry) statements.push(env.DB.prepare(`INSERT INTO proxy_ip_source_sync(source_id, country, last_synced_at, last_status, last_error)
 			VALUES (?1, ?2, ?3, 'error', ?4) ON CONFLICT(source_id, country) DO UPDATE SET
 			last_synced_at = ?3, last_status = 'error', last_error = ?4`).bind(source.id, targetCountry, now, message));
 		await env.DB.batch(statements);
+		if (Number(source.consecutive_failures || 0) + 1 >= 3) await 发送管理通知(env, `source-failure:${source.id}`, 'PROXYIP 数据源连续同步失败', { source_id: source.id, name: source.name, error: message }, 3600);
 		return { id: source.id, name: source.name, success: false, error: message };
 	}
 }
@@ -1123,9 +1529,10 @@ async function 检测访问PROXYIP池(env, country, limit = 8) {
 	const checkedAt = Date.now();
 	const result = await env.DB.prepare(`SELECT * FROM proxy_ip_pool
 		WHERE country = ?1 AND enabled = 1
+			AND (cooldown_until IS NULL OR cooldown_until <= ?3)
 			AND (health_status <> 'healthy' OR last_checked_at IS NULL OR last_checked_at < ?2)
-		ORDER BY CASE health_status WHEN 'unknown' THEN 0 WHEN 'unhealthy' THEN 1 ELSE 2 END, RANDOM()
-		LIMIT ?3`).bind(country, checkedAt - 6 * 3600000, Math.min(24, Math.max(1, Number(limit) || 8))).all();
+		ORDER BY CASE health_status WHEN 'unknown' THEN 0 WHEN 'unhealthy' THEN 1 ELSE 2 END, health_score ASC, RANDOM()
+		LIMIT ?4`).bind(country, checkedAt - 6 * 3600000, checkedAt, Math.min(24, Math.max(1, Number(limit) || 8))).all();
 	const candidates = result.results || [];
 	let success = 0, failed = 0, unavailable = 0, cursor = 0;
 	const worker = async () => {
@@ -1141,23 +1548,128 @@ async function 检测访问PROXYIP池(env, country, limit = 8) {
 				if (data.success) {
 					success++;
 					await env.DB.prepare(`UPDATE proxy_ip_pool SET health_status = 'healthy', latency_ms = ?1,
-						failure_count = 0, last_checked_at = ?2, last_success_at = ?2, last_error = '' WHERE id = ?3`)
+						failure_count = 0, consecutive_failures = 0, cooldown_until = NULL,
+						health_score = MIN(100, health_score + 8), last_checked_at = ?2, last_success_at = ?2, last_error = '' WHERE id = ?3`)
 						.bind(Math.max(0, Math.round(Number(data.responseTime) || 0)), checkedAt, candidate.id).run();
 				} else {
 					failed++;
-					await env.DB.prepare(`UPDATE proxy_ip_pool SET health_status = 'unhealthy', latency_ms = NULL,
-						failure_count = failure_count + 1, last_checked_at = ?1, last_error = 'PROXYIP 检测失败' WHERE id = ?2`)
-						.bind(checkedAt, candidate.id).run();
+					await 记录访问PROXYIP结果(env, { country, proxyIP: candidate.proxy_ip, success: false, real: false, error: 'PROXYIP 检测失败', checkedAt });
 				}
 			} catch (error) {
 				unavailable++;
-				await env.DB.prepare(`UPDATE proxy_ip_pool SET last_checked_at = ?1, last_error = ?2 WHERE id = ?3`)
-					.bind(checkedAt, String(error?.message || error).slice(0, 200), candidate.id).run();
+				await 记录访问PROXYIP结果(env, { country, proxyIP: candidate.proxy_ip, success: false, real: false, error: String(error?.message || error), checkedAt });
 			} finally { clearTimeout(timer); }
 		}
 	};
 	await Promise.all(Array.from({ length: Math.min(4, candidates.length) }, worker));
 	return { checked: candidates.length, success, failed, unavailable };
+}
+
+async function 记录访问PROXYIP结果(env, { country, proxyIP, success, real = true, latency = null, error = '', checkedAt = Date.now() }) {
+	if (!env.DB || !proxyIP) return;
+	const threshold = Math.min(10, Math.max(2, Number(env.PROXYIP_FAILURE_THRESHOLD) || 3));
+	const cooldownMs = Math.min(24 * 3600000, Math.max(60000, Number(env.PROXYIP_COOLDOWN_MINUTES) * 60000 || 30 * 60000));
+	const endpoint = String(proxyIP).toLowerCase();
+	const hostOnly = endpoint.replace(/:443$/, '');
+	const record = await env.DB.prepare(`SELECT id, consecutive_failures FROM proxy_ip_pool
+		WHERE country = ?1 AND (LOWER(proxy_ip) = ?2 OR LOWER(proxy_ip) = ?3) ORDER BY CASE WHEN LOWER(proxy_ip) = ?2 THEN 0 ELSE 1 END LIMIT 1`)
+		.bind(country, endpoint, hostOnly).first();
+	if (!record) return;
+	if (success) {
+		await env.DB.prepare(`UPDATE proxy_ip_pool SET health_status = 'healthy', health_score = MIN(100, health_score + ?1),
+			consecutive_failures = 0, failure_count = 0, cooldown_until = NULL, last_success_at = ?2,
+			last_checked_at = CASE WHEN ?3 = 1 THEN last_checked_at ELSE ?2 END,
+			latency_ms = CASE WHEN ?4 IS NULL THEN latency_ms WHEN latency_ms IS NULL THEN ?4 ELSE CAST((latency_ms * 3 + ?4) / 4 AS INTEGER) END,
+			real_success_count = real_success_count + ?3, last_error = '' WHERE id = ?5`)
+			.bind(real ? 5 : 8, checkedAt, real ? 1 : 0, latency == null ? null : Math.max(0, Math.round(latency)), record.id).run();
+	} else {
+		const nextFailures = Number(record.consecutive_failures || 0) + 1;
+		await env.DB.prepare(`UPDATE proxy_ip_pool SET
+			health_score = MAX(0, health_score - ?1), failure_count = failure_count + 1,
+			consecutive_failures = consecutive_failures + 1,
+			health_status = CASE WHEN consecutive_failures + 1 >= ?2 THEN 'unhealthy' ELSE health_status END,
+			cooldown_until = CASE WHEN consecutive_failures + 1 >= ?2 THEN ?3 ELSE cooldown_until END,
+			last_checked_at = CASE WHEN ?4 = 1 THEN last_checked_at ELSE ?5 END,
+			real_failure_count = real_failure_count + ?4,
+			last_real_failure = CASE WHEN ?4 = 1 THEN ?5 ELSE last_real_failure END,
+			last_error = ?6 WHERE id = ?7`)
+			.bind(real ? 15 : 10, threshold, checkedAt + cooldownMs, real ? 1 : 0, checkedAt, String(error || '连接失败').slice(0, 200), record.id).run();
+		if (nextFailures >= threshold) console.warn(`PROXYIP 已隔离: ${country}/${proxyIP}`);
+	}
+}
+
+async function 记录访问代理连接结果(上下文, success, proxyIP, latency = null, error = '') {
+	if (!上下文 || !proxyIP) return;
+	await 记录访问PROXYIP结果(上下文.env, { country: 上下文.记录.country, proxyIP, success, real: true, latency, error });
+	if (!success) return;
+	上下文.代理连接成功 = true;
+	const normalized = String(proxyIP).replace(/:443$/, '');
+	const previous = String(上下文.记录.proxy_ip || '');
+	if (previous && normalized !== previous.replace(/:443$/, '') && String(proxyIP) !== previous) {
+		await 上下文.env.DB.prepare('UPDATE access_links SET proxy_ip = ?1 WHERE id = ?2 AND status = \'active\'').bind(proxyIP, 上下文.记录.id).run();
+		上下文.记录.proxy_ip = proxyIP;
+		if (上下文.leaseId) await 上下文.env.DB.prepare('UPDATE access_connection_leases SET proxy_ip = ?1 WHERE id = ?2').bind(proxyIP, 上下文.leaseId).run();
+		await 写入审计日志(上下文.env, 上下文.request, null, 'access.auto_failover', 'access_link', 上下文.记录.id, { proxy_ip: previous }, { proxy_ip: proxyIP }, true);
+		await 发送管理通知(上下文.env, `failover:${上下文.记录.id}:${proxyIP}`, '自动故障转移', { link_id: 上下文.记录.id, country: 上下文.记录.country, previous_proxy: previous, proxy_ip: proxyIP }, 1800);
+	}
+}
+
+async function 清理访问连接租约(env) {
+	if (!env.DB || typeof env.DB.prepare !== 'function') return;
+	const now = Date.now();
+	await env.DB.batch([
+		env.DB.prepare('DELETE FROM access_connection_leases WHERE expires_at <= ?1').bind(now),
+		env.DB.prepare(`UPDATE access_links SET active_connections = (
+			SELECT COUNT(*) FROM access_connection_leases leases WHERE leases.access_link_id = access_links.id
+		) WHERE active_connections <> (
+			SELECT COUNT(*) FROM access_connection_leases leases WHERE leases.access_link_id = access_links.id
+		)`)
+	]);
+}
+
+async function 发送管理通知(env, eventKey, title, payload, cooldownSeconds = 3600) {
+	const webhook = String(env.NOTIFY_WEBHOOK_URL || '').trim();
+	const telegramToken = String(env.TELEGRAM_BOT_TOKEN || '').trim();
+	const telegramChat = String(env.TELEGRAM_CHAT_ID || '').trim();
+	if (!webhook && !(telegramToken && telegramChat) || !env.DB) return { sent: false, reason: 'not_configured' };
+	const now = Date.now(), payloadHash = await SHA256十六进制(JSON.stringify(payload || {}));
+	const previous = await env.DB.prepare('SELECT * FROM notification_state WHERE event_key = ?1').bind(eventKey).first();
+	if (previous && Number(previous.cooldown_until) > now && previous.last_payload_hash === payloadHash) return { sent: false, reason: 'cooldown' };
+	const text = `${title}\n${JSON.stringify(payload || {})}`.slice(0, 3500);
+	const tasks = [], controller = new AbortController(), timer = setTimeout(() => controller.abort(), 8000);
+	if (webhook) {
+		try {
+			const safeUrl = 标准化访问数据源URL(webhook);
+			tasks.push(fetch(safeUrl, { method: 'POST', redirect: 'manual', signal: controller.signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ event: eventKey, title, data: payload, created_at: now }) }));
+		} catch (error) { console.error('Webhook 配置无效:', error?.message || error); }
+	}
+	if (telegramToken && telegramChat && /^[A-Za-z0-9:_-]{20,}$/.test(telegramToken)) {
+		tasks.push(fetch(`https://api.telegram.org/bot${telegramToken}/sendMessage`, { method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: telegramChat, text, disable_web_page_preview: true }) }));
+	}
+	const results = await Promise.allSettled(tasks);
+	clearTimeout(timer);
+	const sent = results.some(item => item.status === 'fulfilled' && item.value?.ok);
+	if (tasks.length) await env.DB.prepare(`INSERT INTO notification_state(event_key, last_payload_hash, last_sent_at, cooldown_until)
+		VALUES (?1, ?2, ?3, ?4) ON CONFLICT(event_key) DO UPDATE SET last_payload_hash = ?2, last_sent_at = ?3, cooldown_until = ?4`)
+		.bind(eventKey, payloadHash, now, now + Math.max(60, cooldownSeconds) * 1000).run();
+	return { sent, results: results.length };
+}
+
+async function 检查访问管理通知(env) {
+	const now = Date.now(), defaultMinimum = Math.min(100, Math.max(1, Number(env.MIN_HEALTHY_IPS_PER_COUNTRY) || 3));
+	const low = await env.DB.prepare(`SELECT l.country, COUNT(DISTINCT CASE WHEN p.enabled = 1 AND p.health_status = 'healthy'
+		AND (p.cooldown_until IS NULL OR p.cooldown_until <= ?1) THEN p.id END) AS healthy,
+		COALESCE(c.min_healthy_ips, ?2) AS minimum
+		FROM access_links l LEFT JOIN proxy_ip_pool p ON p.country = l.country
+		LEFT JOIN country_health_config c ON c.country = l.country
+		WHERE l.status = 'active' GROUP BY l.country HAVING healthy < minimum`).bind(now, defaultMinimum).all();
+	for (const item of low.results || []) await 发送管理通知(env, `low-capacity:${item.country}`, '国家健康 PROXYIP 低于阈值', { country: item.country, healthy: Number(item.healthy || 0), minimum: Number(item.minimum || defaultMinimum) }, 3600);
+	const expiring = await env.DB.prepare(`SELECT id, country, expires_at FROM access_links
+		WHERE status = 'active' AND expires_at > ?1 AND expires_at <= ?2 ORDER BY expires_at LIMIT 50`).bind(now, now + 24 * 3600000).all();
+	for (const link of expiring.results || []) await 发送管理通知(env, `expiring:${link.id}`, '访问链接即将到期', { link_id: link.id, country: link.country, expires_at: link.expires_at }, 21600);
+	const anomalyThreshold = Math.min(100000, Math.max(10, Number(env.ABNORMAL_CONNECTIONS_PER_HOUR) || 500));
+	const anomaly = await env.DB.prepare('SELECT access_link_id, COUNT(*) AS total FROM access_connection_events WHERE started_at >= ?1 GROUP BY access_link_id HAVING total >= ?2 LIMIT 50').bind(now - 3600000, anomalyThreshold).all();
+	for (const item of anomaly.results || []) await 发送管理通知(env, `connection-anomaly:${item.access_link_id}`, '访问链接连接量异常', { link_id: item.access_link_id, connections_last_hour: Number(item.total) }, 3600);
 }
 
 function 格式化后台访问记录(记录, config, origin) {
@@ -1170,6 +1682,8 @@ function 格式化后台访问记录(记录, config, origin) {
 	return {
 		...记录,
 		display_status,
+		tags_list: 解析访问标签(记录.tags),
+		remaining_ms: 记录.expires_at == null ? null : Math.max(0, Number(记录.expires_at) - now),
 		duration_hours: Number(记录.duration_seconds) / 3600,
 		duration_label: Number(记录.duration_seconds) === 0 ? '永久' : `${Number(记录.duration_seconds) / 3600} 小时`,
 		subscription_url: `${origin}/sub?token=${encodeURIComponent(记录.token)}`,
@@ -1177,21 +1691,228 @@ function 格式化后台访问记录(记录, config, origin) {
 	};
 }
 
-async function 处理访问链接管理请求(request, env, host, userID, UA, url) {
+function 解析访问标签(value) {
+	try {
+		const parsed = JSON.parse(String(value || '[]'));
+		if (Array.isArray(parsed)) return parsed.map(item => String(item).trim()).filter(Boolean).slice(0, 20);
+	} catch (_) { }
+	return String(value || '').split(',').map(item => item.trim()).filter(Boolean).slice(0, 20);
+}
+
+function 标准化访问标签(value) {
+	const values = Array.isArray(value) ? value : String(value || '').split(',');
+	const tags = [...new Set(values.map(item => String(item).trim().slice(0, 30)).filter(Boolean))].slice(0, 20);
+	return JSON.stringify(tags);
+}
+
+function 访问链接安全摘要(record) {
+	if (!record) return null;
+	return {
+		id: record.id, country: record.country, status: record.status, duration_seconds: record.duration_seconds,
+		proxy_ip: record.proxy_ip, note: record.note, tags: 解析访问标签(record.tags), first_used_at: record.first_used_at,
+		expires_at: record.expires_at, connection_count: record.connection_count, active_connections: record.active_connections,
+		max_concurrent_connections: record.max_concurrent_connections, max_total_connections: record.max_total_connections,
+		bind_first_ip: Number(record.bind_first_ip) === 1, bound: !!record.bound_ip
+	};
+}
+
+async function 执行访问链接操作({ session, env, request, adminSession, id, action, body = {} }) {
+	const before = await session.prepare('SELECT * FROM access_links WHERE id = ?1').bind(id).first();
+	if (!before) throw new Error('访问链接不存在');
+	const now = Date.now();
+	let result;
+	if (action === 'revoke' || action === 'disable') {
+		result = await session.prepare("UPDATE access_links SET status = 'revoked' WHERE id = ?1 AND status = 'active'").bind(id).run();
+		关闭本实例链接连接(id);
+	} else if (action === 'enable' || action === 'restore') {
+		const restoreError = 获取访问恢复错误(before, now);
+		if (restoreError) throw new Error(restoreError);
+		result = await session.prepare("UPDATE access_links SET status = 'active' WHERE id = ?1 AND status = 'revoked' AND (expires_at IS NULL OR expires_at > ?2)").bind(id, now).run();
+	} else if (action === 'renew') {
+		const hours = Math.floor(Number(body.hours || body.durationHours));
+		if (!Number.isInteger(hours) || hours < 1 || hours > 8760) throw new Error('续期时长必须是 1 到 8760 小时');
+		if (Number(before.duration_seconds) === 0 && before.expires_at == null) throw new Error('永久链接无需续期');
+		const seconds = hours * 3600;
+		const renewedExpiry = 计算续期到期时间(before.expires_at, now, hours);
+		result = await session.prepare(`UPDATE access_links SET status = 'active', duration_seconds = duration_seconds + ?1,
+			expires_at = ?2 WHERE id = ?3`).bind(seconds, renewedExpiry, id).run();
+	} else if (action === 'reset') {
+		关闭本实例链接连接(id);
+		await session.prepare('DELETE FROM access_connection_leases WHERE access_link_id = ?1').bind(id).run();
+		result = await session.prepare(`UPDATE access_links SET status = 'active', proxy_ip = NULL, first_used_at = NULL,
+			expires_at = NULL, last_used_at = NULL, connection_count = 0, active_connections = 0,
+			last_client_ip = NULL, last_client_asn = NULL, bound_ip = NULL, connection_epoch = connection_epoch + 1 WHERE id = ?1`).bind(id).run();
+	} else if (action === 'reassign') {
+		const candidate = await session.prepare(`SELECT proxy_ip FROM proxy_ip_pool WHERE country = ?1 AND enabled = 1
+			AND proxy_ip <> COALESCE(?2, '') AND (cooldown_until IS NULL OR cooldown_until <= ?3)
+			AND health_status <> 'unhealthy' ORDER BY CASE health_status WHEN 'healthy' THEN 0 ELSE 1 END,
+			health_score DESC, latency_ms ASC, RANDOM() LIMIT 1`).bind(before.country, before.proxy_ip, now).first();
+		if (!candidate) throw new Error(`${before.country} 没有其他健康备用 PROXYIP`);
+		result = await session.prepare('UPDATE access_links SET proxy_ip = ?1 WHERE id = ?2').bind(candidate.proxy_ip, id).run();
+	} else if (action === 'rotate') {
+		const mode = String(body.mode || 'both');
+		if (!['token', 'uuid', 'both'].includes(mode)) throw new Error('轮换类型无效');
+		const rotated = 生成轮换访问凭据(before, mode);
+		result = await session.prepare('UPDATE access_links SET token = ?1, uuid = ?2 WHERE id = ?3').bind(rotated.token, rotated.uuid, id).run();
+	} else if (action === 'edit') {
+		const maxConcurrent = Math.floor(Number(body.maxConcurrentConnections ?? body.max_concurrent_connections ?? 0));
+		const maxTotal = Math.floor(Number(body.maxTotalConnections ?? body.max_total_connections ?? 0));
+		if (!Number.isInteger(maxConcurrent) || maxConcurrent < 0 || maxConcurrent > 10000) throw new Error('并发上限必须是 0 到 10000，0 表示不限');
+		if (!Number.isInteger(maxTotal) || maxTotal < 0 || maxTotal > 10000000) throw new Error('累计上限必须是 0 到 10000000，0 表示不限');
+		const bindFirstIP = body.bindFirstIp === true || body.bind_first_ip === true || String(body.bindFirstIp ?? body.bind_first_ip) === '1';
+		const note = String(body.note ?? before.note ?? '').trim().slice(0, 200);
+		const tags = 标准化访问标签(body.tags ?? before.tags ?? '');
+		result = await session.prepare(`UPDATE access_links SET note = ?1, tags = ?2, max_concurrent_connections = ?3,
+			max_total_connections = ?4, bind_first_ip = ?5,
+			bound_ip = CASE WHEN ?5 = 1 THEN bound_ip ELSE NULL END WHERE id = ?6`)
+			.bind(note, tags, maxConcurrent, maxTotal, bindFirstIP ? 1 : 0, id).run();
+	} else if (action === 'tags') {
+		result = await session.prepare('UPDATE access_links SET tags = ?1 WHERE id = ?2').bind(标准化访问标签(body.tags), id).run();
+	} else if (action === 'delete') {
+		关闭本实例链接连接(id);
+		await session.prepare('DELETE FROM access_connection_leases WHERE access_link_id = ?1').bind(id).run();
+		await session.prepare('DELETE FROM access_connection_events WHERE access_link_id = ?1').bind(id).run();
+		result = await session.prepare('DELETE FROM access_links WHERE id = ?1').bind(id).run();
+	} else throw new Error('不支持的链接操作');
+	if (!Number(result?.meta?.changes || 0)) throw new Error('链接状态未变化，可能已被其他操作更新');
+	const after = action === 'delete' ? null : await session.prepare('SELECT * FROM access_links WHERE id = ?1').bind(id).first();
+	await 写入审计日志(env, request, adminSession, `access.${action}`, 'access_link', id, 访问链接安全摘要(before), 访问链接安全摘要(after), true);
+	return { id, success: true, before: 访问链接安全摘要(before), after: 访问链接安全摘要(after) };
+}
+
+function 模拟访问链接激活(record, now, clientIP) {
+	const error = 访问限制错误(record, clientIP, now);
+	if (error) return { error };
+	return {
+		...record,
+		first_used_at: record.first_used_at ?? now,
+		expires_at: Number(record.duration_seconds) === 0 ? null : (record.expires_at ?? now + Number(record.duration_seconds) * 1000),
+		last_used_at: now,
+		connection_count: Number(record.connection_count || 0) + 1,
+		active_connections: Number(record.active_connections || 0) + 1,
+		bound_ip: Number(record.bind_first_ip) === 1 ? (record.bound_ip || clientIP) : record.bound_ip
+	};
+}
+
+function 计算续期到期时间(expiresAt, now, hours) {
+	return Math.max(Number(expiresAt || now), now) + Number(hours) * 3600000;
+}
+
+function 获取访问恢复错误(record, now = Date.now()) {
+	if (record?.status !== 'revoked') return '只有已停用的链接可以恢复';
+	if (record.expires_at !== null && Number(record.expires_at) <= now) return '链接已过期，请使用“续期”而不是“恢复”';
+	return null;
+}
+
+function 模拟重置访问链接(record) {
+	return { ...record, status: 'active', proxy_ip: null, first_used_at: null, expires_at: null, last_used_at: null, connection_count: 0, active_connections: 0, last_client_ip: null, last_client_asn: null, bound_ip: null, connection_epoch: Number(record.connection_epoch || 0) + 1 };
+}
+
+function 生成轮换访问凭据(record, mode) {
+	return { ...record, token: mode === 'uuid' ? record.token : 生成随机访问令牌(), uuid: mode === 'token' ? record.uuid : crypto.randomUUID() };
+}
+
+function 选择健康故障转移候选(candidates, currentProxy, now = Date.now()) {
+	return [...candidates].filter(item => item.enabled !== 0 && Number(item.cooldown_until || 0) <= now && item.health_status !== 'unhealthy' && item.proxy_ip !== currentProxy)
+		.sort((a, b) => Number(b.health_score || 0) - Number(a.health_score || 0) || Number(a.latency_ms ?? Infinity) - Number(b.latency_ms ?? Infinity))[0] || null;
+}
+
+function 计算登录失败状态(record, now, threshold, blockMs) {
+	const output = { ...record, failure_count: Number(record.failure_count || 0) + 1, last_attempt_at: now };
+	if (output.failure_count >= threshold) output.blocked_until = now + blockMs;
+	return output;
+}
+
+function 汇总批量操作结果(results) {
+	const affected = results.filter(item => item.success).length;
+	return { affected, failed: results.filter(item => !item.success), partial: affected > 0 && affected < results.length };
+}
+
+function CSV字段(value) {
+	const text = value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value);
+	return `"${text.replace(/"/g, '""')}"`;
+}
+
+async function 处理访问链接管理请求(request, env, host, userID, UA, url, 管理员会话) {
 	if (!env.DB || typeof env.DB.prepare !== 'function') return 访问错误响应('请先为项目绑定名为 DB 的 D1 数据库', 503);
 	try {
 		await 确保访问数据库(env);
 		const pathname = url.pathname.toLowerCase();
-		if (pathname === '/admin/access' && request.method === 'GET') return 访问链接管理页面();
+		if (pathname === '/admin/access' && request.method === 'GET') return 访问链接增强管理页面();
 
 		const session = 获取访问数据库会话(env);
+		if (pathname === '/admin/access/api/audit' && request.method === 'GET') {
+			const limit = Math.min(100, Math.max(1, Math.floor(Number(url.searchParams.get('limit')) || 25)));
+			const offset = Math.max(0, Math.floor(Number(url.searchParams.get('offset')) || 0));
+			const action = String(url.searchParams.get('action') || '').trim().slice(0, 80);
+			const query = String(url.searchParams.get('q') || '').trim().slice(0, 100);
+			const parts = [], params = [];
+			const param = value => { params.push(value); return `?${params.length}`; };
+			if (action) parts.push(`action = ${param(action)}`);
+			if (query) { const p = param(`%${query}%`); parts.push(`(action LIKE ${p} OR object_type LIKE ${p} OR object_id LIKE ${p} OR COALESCE(error_message, '') LIKE ${p})`); }
+			const where = parts.length ? ` WHERE ${parts.join(' AND ')}` : '';
+			const [logs, count] = await Promise.all([
+				session.prepare(`SELECT * FROM audit_logs${where} ORDER BY id DESC LIMIT ?${params.length + 1} OFFSET ?${params.length + 2}`).bind(...params, limit, offset).all(),
+				session.prepare(`SELECT COUNT(*) AS total FROM audit_logs${where}`).bind(...params).first()
+			]);
+			return 访问JSON响应({ success: true, logs: logs.results || [], pagination: { limit, offset, total: Number(count?.total || 0) } });
+		}
+
+		if (pathname === '/admin/access/api/audit/export' && request.method === 'GET') {
+			const format = String(url.searchParams.get('format') || 'json').toLowerCase();
+			const result = await session.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 10000').all();
+			const logs = result.results || [];
+			const content = format === 'csv'
+				? ['id,created_at,session_id,source_ip,source_asn,action,object_type,object_id,before_summary,after_summary,success,error_message', ...logs.map(row => [row.id, row.created_at, row.session_id, row.source_ip, row.source_asn, row.action, row.object_type, row.object_id, row.before_summary, row.after_summary, row.success, row.error_message].map(CSV字段).join(','))].join('\n')
+				: JSON.stringify({ schema_version: 5, exported_at: Date.now(), audit_logs: logs }, null, 2);
+			return new Response(content, { headers: { 'Content-Type': format === 'csv' ? 'text/csv;charset=utf-8' : 'application/json;charset=utf-8', 'Content-Disposition': `attachment; filename="edgetunnel-audit.${format === 'csv' ? 'csv' : 'json'}"`, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' } });
+		}
+
+		if (pathname === '/admin/access/api/links/export' && request.method === 'GET') {
+			if (request.headers.get('X-Export-Confirmation') !== 'include-sensitive-links') return 访问错误响应('导出包含完整访问凭据，需要明确确认', 428);
+			const format = String(url.searchParams.get('format') || 'json').toLowerCase();
+			const q = String(url.searchParams.get('q') || '').trim().slice(0, 100), country = String(url.searchParams.get('country') || '').trim().toUpperCase(), tag = String(url.searchParams.get('tag') || '').trim().slice(0, 30);
+			const status = String(url.searchParams.get('status') || 'all').toLowerCase(), expiry = String(url.searchParams.get('expiry') || 'all').toLowerCase(), now = Date.now();
+			const parts = [], params = [];
+			const param = value => { params.push(value); return `?${params.length}`; };
+			if (q) { const p = param(`%${q}%`); parts.push(`(CAST(id AS TEXT) LIKE ${p} OR note LIKE ${p} OR uuid LIKE ${p} OR country LIKE ${p} OR COALESCE(proxy_ip,'') LIKE ${p})`); }
+			if (country) parts.push(`country = ${param(标准化访问国家(country))}`);
+			if (tag) parts.push(`tags LIKE ${param(`%${tag}%`)}`);
+			if (status === 'unused') parts.push("status = 'active' AND first_used_at IS NULL");
+			else if (status === 'active') parts.push(`status = 'active' AND first_used_at IS NOT NULL AND (expires_at IS NULL OR expires_at > ${param(now)})`);
+			else if (status === 'expired') parts.push(`status = 'active' AND expires_at IS NOT NULL AND expires_at <= ${param(now)}`);
+			else if (status === 'revoked') parts.push("status <> 'active'");
+			if (expiry === '24h') parts.push(`expires_at > ${param(now)} AND expires_at <= ${param(now + 86400000)}`);
+			else if (expiry === '7d') parts.push(`expires_at > ${param(now)} AND expires_at <= ${param(now + 7 * 86400000)}`);
+			else if (expiry === 'expired') parts.push(`expires_at IS NOT NULL AND expires_at <= ${param(now)}`);
+			const result = await session.prepare(`SELECT * FROM access_links${parts.length ? ` WHERE ${parts.join(' AND ')}` : ''} ORDER BY id DESC LIMIT 10000`).bind(...params).all();
+			const links = result.results || [];
+			const content = format === 'csv'
+				? ['id,token,uuid,country,status,note,tags,duration_seconds,proxy_ip,first_used_at,expires_at,last_used_at,connection_count,active_connections,max_concurrent_connections,max_total_connections,bind_first_ip,bound_ip', ...links.map(row => ['id','token','uuid','country','status','note','tags','duration_seconds','proxy_ip','first_used_at','expires_at','last_used_at','connection_count','active_connections','max_concurrent_connections','max_total_connections','bind_first_ip','bound_ip'].map(key => CSV字段(row[key])).join(','))].join('\n')
+				: JSON.stringify({ schema_version: 5, exported_at: Date.now(), access_links: links }, null, 2);
+			return new Response(content, { headers: { 'Content-Type': format === 'csv' ? 'text/csv;charset=utf-8' : 'application/json;charset=utf-8', 'Content-Disposition': `attachment; filename="edgetunnel-access-links.${format === 'csv' ? 'csv' : 'json'}"`, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' } });
+		}
+
+		if (pathname === '/admin/access/api/backup' && request.method === 'GET') {
+			if (request.headers.get('X-Export-Confirmation') !== 'backup-operational-data') return 访问错误响应('备份导出需要明确确认', 428);
+			const tables = ['access_links', 'proxy_ip_pool', 'proxy_ip_sources', 'proxy_ip_source_sync', 'country_health_config'];
+			const data = {};
+			for (const table of tables) data[table] = (await session.prepare(`SELECT * FROM ${table}`).all()).results || [];
+			const content = JSON.stringify({ product: 'edgetunnel-access', schema_version: 5, exported_at: Date.now(), data }, null, 2);
+			return new Response(content, { headers: { 'Content-Type': 'application/json;charset=utf-8', 'Content-Disposition': 'attachment; filename="edgetunnel-d1-backup.json"', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' } });
+		}
+
 		if (pathname === '/admin/access/api/state' && request.method === 'GET') {
+			await 清理访问连接租约(env);
 			const requestedLimit = Math.floor(Number(url.searchParams.get('limit')));
 			const requestedOffset = Math.floor(Number(url.searchParams.get('offset')));
 			const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(500, requestedLimit) : 200;
 			const offset = Number.isFinite(requestedOffset) && requestedOffset > 0 ? requestedOffset : 0;
 			const searchQuery = String(url.searchParams.get('q') || '').trim().slice(0, 100);
 			const statusFilter = String(url.searchParams.get('status') || 'all').trim().toLowerCase();
+			const countryFilter = String(url.searchParams.get('country') || '').trim();
+			const tagFilter = String(url.searchParams.get('tag') || '').trim().slice(0, 30);
+			const expiryFilter = String(url.searchParams.get('expiry') || 'all').trim().toLowerCase();
 			const whereParts = [];
 			const whereParams = [];
 			const addWhereParam = value => { whereParams.push(value); return `?${whereParams.length}`; };
@@ -1205,10 +1926,15 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			else if (statusFilter === 'active') { const nowParam = addWhereParam(now); whereParts.push(`status = 'active' AND first_used_at IS NOT NULL AND (expires_at IS NULL OR expires_at > ${nowParam})`); }
 			else if (statusFilter === 'expired') { const nowParam = addWhereParam(now); whereParts.push(`status = 'active' AND expires_at IS NOT NULL AND expires_at <= ${nowParam}`); }
 			else if (statusFilter === 'revoked') whereParts.push("status <> 'active'");
+			if (countryFilter) whereParts.push(`country = ${addWhereParam(标准化访问国家(countryFilter))}`);
+			if (tagFilter) whereParts.push(`tags LIKE ${addWhereParam(`%${tagFilter}%`)}`);
+			if (expiryFilter === '24h') whereParts.push(`expires_at > ${addWhereParam(now)} AND expires_at <= ${addWhereParam(now + 86400000)}`);
+			else if (expiryFilter === '7d') whereParts.push(`expires_at > ${addWhereParam(now)} AND expires_at <= ${addWhereParam(now + 7 * 86400000)}`);
+			else if (expiryFilter === 'expired') whereParts.push(`expires_at IS NOT NULL AND expires_at <= ${addWhereParam(now)}`);
 			const whereSQL = whereParts.length ? ` WHERE ${whereParts.join(' AND ')}` : '';
 			const limitParam = `?${whereParams.length + 1}`;
 			const offsetParam = `?${whereParams.length + 2}`;
-			const [链接结果, 筛选链接统计, IP结果, 统计结果, 数据源结果, 国家池结果] = await Promise.all([
+			const [链接结果, 筛选链接统计, IP结果, 统计结果, 数据源结果, 国家池结果, 二十四小时统计] = await Promise.all([
 				session.prepare(`SELECT * FROM access_links${whereSQL} ORDER BY id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`).bind(...whereParams, limit, offset).all(),
 				session.prepare(`SELECT COUNT(*) AS total FROM access_links${whereSQL}`).bind(...whereParams).first(),
 				session.prepare(`SELECT p.*, COALESCE(s.name, '手动添加') AS source_name FROM proxy_ip_pool p
@@ -1217,31 +1943,102 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 					SUM(CASE WHEN status = 'active' AND first_used_at IS NULL THEN 1 ELSE 0 END) AS unused,
 					SUM(CASE WHEN status = 'active' AND first_used_at IS NOT NULL AND (expires_at IS NULL OR expires_at > ?1) THEN 1 ELSE 0 END) AS active,
 					SUM(CASE WHEN status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?1 THEN 1 ELSE 0 END) AS expired,
-					SUM(CASE WHEN status <> 'active' THEN 1 ELSE 0 END) AS revoked
+					SUM(CASE WHEN status <> 'active' THEN 1 ELSE 0 END) AS revoked,
+					SUM(active_connections) AS current_connections
 					FROM access_links`).bind(now).first(),
 				session.prepare('SELECT * FROM proxy_ip_sources ORDER BY id').all(),
-				session.prepare(`SELECT country, COUNT(*) AS total,
-					SUM(CASE WHEN enabled = 1 AND health_status <> 'unhealthy' THEN 1 ELSE 0 END) AS available,
-					SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
-					SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
-					FROM proxy_ip_pool GROUP BY country ORDER BY country`).all()
+				session.prepare(`SELECT p.country, COUNT(DISTINCT p.id) AS total,
+					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status <> 'unhealthy' THEN p.id END) AS available,
+					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status = 'healthy' THEN p.id END) AS healthy,
+					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status = 'unknown' THEN p.id END) AS unknown,
+					COUNT(DISTINCT CASE WHEN enabled = 1 AND (health_status = 'unhealthy' OR cooldown_until > ?1) THEN p.id END) AS isolated,
+					ROUND(AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END)) AS average_latency_ms,
+					MAX(last_checked_at) AS last_checked_at, ROUND(AVG(health_score)) AS average_health_score,
+					(SELECT COUNT(*) FROM access_links l WHERE l.country = p.country AND l.proxy_ip IS NOT NULL) AS assigned,
+					COALESCE(c.min_healthy_ips, ?2) AS min_healthy_ips
+					FROM proxy_ip_pool p LEFT JOIN country_health_config c ON c.country = p.country
+					GROUP BY p.country ORDER BY p.country`).bind(now, Math.min(100, Math.max(1, Number(env.MIN_HEALTHY_IPS_PER_COUNTRY) || 3))).all(),
+				session.prepare(`SELECT COUNT(*) AS connections_24h,
+					SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures_24h FROM access_connection_events WHERE started_at >= ?1`).bind(now - 86400000).first()
 			]);
+			const poolStats = 国家池结果.results || [];
+			const 总体统计 = 统计结果 || { total: 0, unused: 0, active: 0, expired: 0, revoked: 0, current_connections: 0 };
+			const healthTotal = poolStats.reduce((sum, item) => sum + Number(item.total || 0), 0);
+			const healthyTotal = poolStats.reduce((sum, item) => sum + Number(item.healthy || 0), 0);
+			总体统计.connections_24h = Number(二十四小时统计?.connections_24h || 0);
+			总体统计.failures_24h = Number(二十四小时统计?.failures_24h || 0);
+			总体统计.failure_rate_24h = 总体统计.connections_24h ? Math.round(总体统计.failures_24h / 总体统计.connections_24h * 1000) / 10 : 0;
+			总体统计.healthy_ip_ratio = healthTotal ? Math.round(healthyTotal / healthTotal * 1000) / 10 : 0;
+			总体统计.low_capacity_countries = poolStats.filter(item => Number(item.healthy || 0) < Number(item.min_healthy_ips || 0)).length;
 			const 基础配置 = await 读取config_JSON(env, host, userID, UA);
 			return 访问JSON响应({
 				success: true,
-				stats: 统计结果 || { total: 0, unused: 0, active: 0, expired: 0, revoked: 0 },
+				stats: 总体统计,
 				pagination: { limit, offset, total: Number(筛选链接统计?.total || 0), query: searchQuery, status: statusFilter },
 				links: (链接结果.results || []).map(item => 格式化后台访问记录(item, 基础配置, url.origin)),
 				pools: IP结果.results || [],
 				sources: 数据源结果.results || [],
-				poolStats: 国家池结果.results || []
+				poolStats,
+				security: { session_expires_at: 管理员会话.expires_at, notifications_configured: !!env.NOTIFY_WEBHOOK_URL || !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) }
 			});
 		}
 
 		if (request.method !== 'POST') return 访问错误响应('不支持的请求方法', 405);
-		const origin = request.headers.get('Origin');
-		if (origin && origin !== url.origin) return 访问错误响应('请求来源校验失败', 403);
+		const 安全错误 = await 验证管理员修改请求(request, env, url, 管理员会话, true);
+		if (安全错误) return 安全错误;
+		if (!(request.headers.get('Content-Type') || '').toLowerCase().includes('application/json')) return 访问错误响应('Content-Type 必须是 application/json', 415);
 		const body = await request.json();
+
+		if (pathname === '/admin/access/api/session/logout-all') {
+			await session.prepare('UPDATE admin_sessions SET revoked_at = ?1 WHERE revoked_at IS NULL').bind(Date.now()).run();
+			await 写入审计日志(env, request, 管理员会话, 'admin.logout_all', 'admin_session', '*', null, { revoked: 'all' }, true);
+			const response = 访问JSON响应({ success: true, message: '所有管理员会话均已退出，请重新登录' });
+			response.headers.append('Set-Cookie', 'admin_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict');
+			response.headers.append('Set-Cookie', 'admin_csrf=; Path=/; Max-Age=0; Secure; SameSite=Strict');
+			return response;
+		}
+
+		if (pathname === '/admin/access/api/health/threshold') {
+			const country = 标准化访问国家(body.country), minimum = Math.floor(Number(body.minimum));
+			if (!Number.isInteger(minimum) || minimum < 1 || minimum > 100) throw new Error('最低健康 IP 阈值必须是 1 到 100');
+			const before = await session.prepare('SELECT * FROM country_health_config WHERE country = ?1').bind(country).first();
+			await session.prepare(`INSERT INTO country_health_config(country, min_healthy_ips, updated_at) VALUES (?1, ?2, ?3)
+				ON CONFLICT(country) DO UPDATE SET min_healthy_ips = ?2, updated_at = ?3`).bind(country, minimum, Date.now()).run();
+			await 写入审计日志(env, request, 管理员会话, 'proxy.threshold.update', 'country', country, before, { country, min_healthy_ips: minimum }, true);
+			return 访问JSON响应({ success: true, message: `${country} 最低健康 IP 阈值已设为 ${minimum}` });
+		}
+
+		if (pathname === '/admin/access/api/backup/restore') {
+			if (body?.product !== 'edgetunnel-access' || Number(body?.schema_version) !== 5 || !body?.data || typeof body.data !== 'object') throw new Error('备份 schema/version 不兼容');
+			const overwrite = body.mode === 'overwrite';
+			if (overwrite && body.confirmOverwrite !== 'RESTORE OVERWRITE') throw new Error('覆盖恢复需要二次确认文本 RESTORE OVERWRITE');
+			const tableColumns = {
+				proxy_ip_sources: ['id','name','url','default_country','enabled','refresh_minutes','max_per_country','last_synced_at','last_status','last_error','created_at','updated_at','consecutive_failures'],
+				proxy_ip_pool: ['id','country','proxy_ip','enabled','created_at','source_id','health_status','latency_ms','failure_count','last_checked_at','last_success_at','last_error','updated_at','health_score','consecutive_failures','cooldown_until','real_success_count','real_failure_count','last_real_failure'],
+				access_links: ['id','token','uuid','country','duration_seconds','proxy_ip','status','note','created_at','first_used_at','expires_at','last_used_at','connection_count','active_connections','last_client_ip','last_client_asn','max_concurrent_connections','max_total_connections','bind_first_ip','bound_ip','tags','connection_epoch'],
+				proxy_ip_source_sync: ['source_id','country','last_synced_at','last_status','last_error'],
+				country_health_config: ['country','min_healthy_ips','updated_at']
+			};
+			const order = Object.keys(tableColumns), summary = { inserted: 0, skipped: 0, failed: [] };
+			const totalRows = order.reduce((sum, table) => sum + (Array.isArray(body.data[table]) ? body.data[table].length : 0), 0);
+			if (totalRows > 50000) throw new Error('单次恢复最多 50000 条记录');
+			for (const table of order) {
+				const rows = Array.isArray(body.data[table]) ? body.data[table] : [];
+				for (const row of rows) {
+					try {
+						const columns = tableColumns[table].filter(column => Object.prototype.hasOwnProperty.call(row, column));
+						if (!columns.length) { summary.skipped++; continue; }
+						const placeholders = columns.map((_, index) => `?${index + 1}`).join(',');
+						const verb = overwrite ? 'INSERT OR REPLACE' : 'INSERT OR IGNORE';
+						const result = await session.prepare(`${verb} INTO ${table}(${columns.join(',')}) VALUES (${placeholders})`).bind(...columns.map(column => row[column])).run();
+						if (Number(result?.meta?.changes || 0)) summary.inserted++; else summary.skipped++;
+					} catch (error) { summary.failed.push({ table, id: row.id ?? row.country ?? '', error: String(error?.message || error).slice(0, 200) }); }
+				}
+			}
+			await 清理访问连接租约(env);
+			await 写入审计日志(env, request, 管理员会话, 'backup.restore', 'database', '', { mode: overwrite ? 'overwrite' : 'merge', totalRows }, summary, summary.failed.length === 0, summary.failed[0]?.error || '');
+			return 访问JSON响应({ success: true, partial: summary.failed.length > 0, message: `恢复完成：写入 ${summary.inserted}，跳过 ${summary.skipped}，失败 ${summary.failed.length}`, ...summary }, summary.failed.length ? 207 : 200);
+		}
 
 		if (pathname === '/admin/access/api/links') {
 			const country = 标准化访问国家(body.country);
@@ -1250,8 +2047,14 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			const durationHours = isPermanent ? null : Number(durationValue);
 			const count = Math.floor(Number(body.count || 1));
 			const note = String(body.note || '').trim().slice(0, 100);
+			const tags = 标准化访问标签(body.tags || '');
+			const maxConcurrent = Math.floor(Number(body.maxConcurrentConnections || 0));
+			const maxTotal = Math.floor(Number(body.maxTotalConnections || 0));
+			const bindFirstIP = body.bindFirstIp === true || String(body.bindFirstIp) === '1';
 			if (!isPermanent && (!Number.isInteger(durationHours) || durationHours < 1 || durationHours > 8760)) throw new Error('有效时长必须是 1 到 8760 的整数小时，或选择永久');
 			if (!Number.isInteger(count) || count < 1 || count > 100) throw new Error('单次生成数量必须是 1 到 100');
+			if (!Number.isInteger(maxConcurrent) || maxConcurrent < 0 || maxConcurrent > 10000) throw new Error('并发上限必须是 0 到 10000');
+			if (!Number.isInteger(maxTotal) || maxTotal < 0 || maxTotal > 10000000) throw new Error('累计上限必须是 0 到 10000000');
 			await 同步到期访问PROXYIP数据源(env, { country });
 			let poolState = await session.prepare(`SELECT
 				SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
@@ -1272,35 +2075,46 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 				uuid: crypto.randomUUID(),
 				country,
 				duration_seconds: durationSeconds,
-				note: note ? (count > 1 ? `${note}-${index + 1}` : note) : ''
+				note: note ? (count > 1 ? `${note}-${index + 1}` : note) : '', tags,
+				max_concurrent_connections: maxConcurrent, max_total_connections: maxTotal, bind_first_ip: bindFirstIP ? 1 : 0
 			}));
 			await env.DB.batch(records.map(record => env.DB.prepare(`INSERT INTO access_links
-				(token, uuid, country, duration_seconds, status, note, created_at)
-				VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6)`)
-				.bind(record.token, record.uuid, record.country, record.duration_seconds, record.note, createdAt)));
+				(token, uuid, country, duration_seconds, status, note, tags, max_concurrent_connections, max_total_connections, bind_first_ip, created_at)
+				VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9, ?10)`)
+				.bind(record.token, record.uuid, record.country, record.duration_seconds, record.note, record.tags, record.max_concurrent_connections, record.max_total_connections, record.bind_first_ip, createdAt)));
+			await 写入审计日志(env, request, 管理员会话, 'access.create', 'access_link', 'batch', null, { count, country, duration_seconds: durationSeconds, limits: { maxConcurrent, maxTotal, bindFirstIP }, tags: 解析访问标签(tags) }, true);
 			const 基础配置 = await 读取config_JSON(env, host, userID, UA);
-			const created = records.map((record, index) => 格式化后台访问记录({ id: null, ...record, proxy_ip: null, status: 'active', created_at: createdAt, first_used_at: null, expires_at: null, last_used_at: null }, 基础配置, url.origin));
+			const created = records.map((record, index) => 格式化后台访问记录({ id: null, ...record, proxy_ip: null, status: 'active', created_at: createdAt, first_used_at: null, expires_at: null, last_used_at: null, connection_count: 0, active_connections: 0, bound_ip: null }, 基础配置, url.origin));
 			return 访问JSON响应({ success: true, message: `已生成 ${count} 条访问链接，${country} 池可用 ${Number(poolState?.healthy) + Number(poolState?.unknown)} 个 PROXYIP`, links: created }, 201);
 		}
 
 		if (pathname === '/admin/access/api/links/action') {
 			const action = String(body.action || '');
-			if (action === 'delete' && Array.isArray(body.ids)) {
+			if (Array.isArray(body.ids)) {
 				const ids = [...new Set(body.ids.map(Number))];
 				if (!ids.length || ids.length > 100 || ids.some(id => !Number.isInteger(id) || id < 1)) throw new Error('请选择 1 到 100 条有效链接');
-				const results = await env.DB.batch(ids.map(id => env.DB.prepare('DELETE FROM access_links WHERE id = ?1').bind(id)));
-				const deleted = results.reduce((sum, result) => sum + Number(result?.meta?.changes || 0), 0);
-				return 访问JSON响应({ success: true, message: `已删除 ${deleted} 条访问链接`, deleted });
+				if (!['revoke','disable','enable','restore','renew','reset','reassign','tags','delete','rotate'].includes(action)) throw new Error('不支持的批量操作');
+				const results = [];
+				for (const id of ids) {
+					try { results.push(await 执行访问链接操作({ session, env, request, adminSession: 管理员会话, id, action, body })); }
+					catch (error) {
+						results.push({ id, success: false, error: String(error?.message || error).slice(0, 200) });
+						await 写入审计日志(env, request, 管理员会话, `access.${action}`, 'access_link', id, null, null, false, error?.message || error);
+					}
+				}
+				const affected = results.filter(item => item.success).length, failed = results.filter(item => !item.success);
+				await 写入审计日志(env, request, 管理员会话, `access.bulk.${action}`, 'access_link', ids.join(','), { requested: ids.length }, { affected, failures: failed }, failed.length === 0, failed[0]?.error || '');
+				return 访问JSON响应({ success: true, partial: failed.length > 0, message: `批量操作完成：成功 ${affected}，失败 ${failed.length}`, affected, failed }, failed.length ? 207 : 200);
 			}
 			const id = Math.floor(Number(body.id));
 			if (!Number.isInteger(id) || id < 1) throw new Error('链接 ID 无效');
-			if (action === 'delete') await session.prepare('DELETE FROM access_links WHERE id = ?1').bind(id).run();
-			else if (action === 'revoke') await session.prepare("UPDATE access_links SET status = 'revoked' WHERE id = ?1").bind(id).run();
-			else if (action === 'enable') await session.prepare("UPDATE access_links SET status = 'active' WHERE id = ?1").bind(id).run();
-			else if (action === 'reset') await session.prepare("UPDATE access_links SET status = 'active', proxy_ip = NULL, first_used_at = NULL, expires_at = NULL, last_used_at = NULL WHERE id = ?1").bind(id).run();
-			else if (action === 'reassign') await session.prepare('UPDATE access_links SET proxy_ip = NULL WHERE id = ?1').bind(id).run();
-			else throw new Error('不支持的链接操作');
-			return 访问JSON响应({ success: true, message: '操作成功' });
+			try {
+				const result = await 执行访问链接操作({ session, env, request, adminSession: 管理员会话, id, action, body });
+				return 访问JSON响应({ success: true, message: '操作成功', result });
+			} catch (error) {
+				await 写入审计日志(env, request, 管理员会话, `access.${action}`, 'access_link', id, null, null, false, error?.message || error);
+				throw error;
+			}
 		}
 
 		if (pathname === '/admin/access/api/pools') {
@@ -1312,6 +2126,7 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			await env.DB.batch(proxies.map(proxy => env.DB.prepare(`INSERT INTO proxy_ip_pool(country, proxy_ip, enabled, created_at, health_status, updated_at)
 				VALUES (?1, ?2, 1, ?3, 'unknown', ?3) ON CONFLICT(country, proxy_ip) DO UPDATE SET enabled = 1, updated_at = ?3`)
 				.bind(country, proxy, createdAt)));
+			await 写入审计日志(env, request, 管理员会话, 'proxy.pool.add', 'proxy_pool', country, null, { count: proxies.length }, true);
 			return 访问JSON响应({ success: true, message: `已向 ${country} IP 池加入 ${proxies.length} 个地址` }, 201);
 		}
 
@@ -1319,10 +2134,16 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			const id = Math.floor(Number(body.id));
 			const action = String(body.action || '');
 			if (!Number.isInteger(id) || id < 1) throw new Error('IP 记录 ID 无效');
-			if (action === 'delete') await session.prepare('DELETE FROM proxy_ip_pool WHERE id = ?1').bind(id).run();
-			else if (action === 'disable') await session.prepare('UPDATE proxy_ip_pool SET enabled = 0 WHERE id = ?1').bind(id).run();
-			else if (action === 'enable') await session.prepare('UPDATE proxy_ip_pool SET enabled = 1 WHERE id = ?1').bind(id).run();
+			const before = await session.prepare('SELECT * FROM proxy_ip_pool WHERE id = ?1').bind(id).first();
+			if (!before) throw new Error('IP 记录不存在');
+			let operation;
+			if (action === 'delete') operation = await session.prepare('DELETE FROM proxy_ip_pool WHERE id = ?1').bind(id).run();
+			else if (action === 'disable') operation = await session.prepare('UPDATE proxy_ip_pool SET enabled = 0 WHERE id = ?1').bind(id).run();
+			else if (action === 'enable') operation = await session.prepare('UPDATE proxy_ip_pool SET enabled = 1 WHERE id = ?1').bind(id).run();
 			else throw new Error('不支持的 IP 池操作');
+			if (!Number(operation?.meta?.changes || 0)) throw new Error('IP 池状态未变化');
+			const after = action === 'delete' ? null : await session.prepare('SELECT * FROM proxy_ip_pool WHERE id = ?1').bind(id).first();
+			await 写入审计日志(env, request, 管理员会话, `proxy.pool.${action}`, 'proxy_pool', id, before, after, true);
 			return 访问JSON响应({ success: true, message: '操作成功' });
 		}
 
@@ -1332,12 +2153,14 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			const imported = summaries.reduce((sum, item) => sum + Number(item.imported || 0), 0);
 			if (!imported) throw new Error(summaries.find(item => item.error)?.error || `${country} 数据源暂无可用记录`);
 			const health = await 检测访问PROXYIP池(env, country, 8);
+			await 写入审计日志(env, request, 管理员会话, 'proxy.pool.sync', 'country', country, null, { imported, health }, true);
 			return 访问JSON响应({ success: true, message: `${country} 已同步 ${imported} 个候选，检测通过 ${health.success} 个`, summaries, health });
 		}
 
 		if (pathname === '/admin/access/api/pools/check') {
 			const country = 标准化访问国家(body.country);
 			const health = await 检测访问PROXYIP池(env, country, body.limit || 8);
+			await 写入审计日志(env, request, 管理员会话, 'proxy.pool.check', 'country', country, null, health, true);
 			return 访问JSON响应({ success: true, message: `${country} 检测完成：可用 ${health.success}，失败 ${health.failed}，检测服务异常 ${health.unavailable}`, health });
 		}
 
@@ -1355,6 +2178,7 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 				ON CONFLICT(url) DO UPDATE SET name = ?1, default_country = ?3, enabled = 1,
 				refresh_minutes = ?4, max_per_country = ?5, updated_at = ?6`)
 				.bind(name, sourceUrl, defaultCountry, refreshMinutes, maxPerCountry, now).run();
+			await 写入审计日志(env, request, 管理员会话, 'proxy.source.save', 'proxy_source', name, null, { name, host: new URL(sourceUrl).hostname, defaultCountry, refreshMinutes, maxPerCountry }, true);
 			return 访问JSON响应({ success: true, message: '数据源已保存；选择国家后点击同步即可导入' }, 201);
 		}
 
@@ -1374,14 +2198,79 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 					session.prepare('DELETE FROM proxy_ip_sources WHERE id = ?1').bind(id)
 				]);
 			} else throw new Error('不支持的数据源操作');
+			const after = action === 'delete' ? null : await session.prepare('SELECT * FROM proxy_ip_sources WHERE id = ?1').bind(id).first();
+			await 写入审计日志(env, request, 管理员会话, `proxy.source.${action}`, 'proxy_source', id, { name: source.name, host: new URL(source.url).hostname, enabled: source.enabled }, after ? { name: after.name, host: new URL(after.url).hostname, enabled: after.enabled } : null, true);
 			return 访问JSON响应({ success: true, message: '数据源操作成功' });
 		}
 
 		return 访问错误响应('管理接口不存在', 404);
 	} catch (error) {
 		console.error('访问链接管理失败:', error);
+		if (request.method === 'POST') await 写入审计日志(env, request, 管理员会话, 'admin.request.failed', 'api', url.pathname, null, null, false, error?.message || error);
 		return 访问错误响应(error?.message || '访问链接管理失败', error?.status || 400);
 	}
+}
+
+function 访问链接增强管理页面() {
+	const 国家选项HTML = 生成访问国家选项();
+	const html = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>限时访问链接</title><style>
+:root{color-scheme:dark;--bg:#07101d;--panel:#111c2e;--panel2:#0c1728;--line:#2b3b59;--text:#edf3ff;--muted:#99a7bd;--blue:#568eff;--red:#ff627b;--green:#3cda91;--amber:#f3c765}*{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#07101d,#0d1830) fixed;color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1500px;margin:auto;padding:24px}.top,.toolbar,.stats,.actions,.pagination{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.top{justify-content:space-between}.top h1{margin:0;font-size:26px}.top a{color:#a8c5ff}.stats{margin:18px 0;display:grid;grid-template-columns:repeat(5,minmax(150px,1fr))}.stat,.card{background:rgba(17,28,46,.96);border:1px solid var(--line);border-radius:14px;box-shadow:0 14px 40px #0003}.stat{padding:14px}.stat b{display:block;font-size:22px}.stat span,.muted{color:var(--muted)}.card{padding:18px;margin:16px 0}h2,h3{margin:0 0 13px}h2{font-size:18px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.form-grid,.filters{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px}.filters{grid-template-columns:2fr repeat(4,1fr);margin-bottom:12px}label{display:block;color:var(--muted);margin:3px 0}input,textarea,select,button{font:inherit}input,textarea,select{width:100%;color:var(--text);background:#091425;border:1px solid #405273;border-radius:8px;padding:9px}input:focus,textarea:focus,select:focus,button:focus-visible,summary:focus-visible{outline:3px solid #568eff66;outline-offset:2px}textarea{min-height:82px;resize:vertical}button{border:0;border-radius:8px;padding:8px 11px;color:#fff;background:var(--blue);cursor:pointer}button.alt{background:#374865}button.danger{background:#963548}button.ghost{background:transparent;border:1px solid var(--line)}button.small{font-size:12px;padding:5px 8px}button:disabled{opacity:.55;cursor:not-allowed}.notice{padding:10px 12px;border-radius:9px;background:#0b2931;border:1px solid #1c5969;color:#9ee1ee;margin-bottom:12px}.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:10px}table{width:100%;border-collapse:collapse;min-width:1080px}th,td{text-align:left;vertical-align:top;padding:9px 10px;border-bottom:1px solid #23324c}th{position:sticky;top:0;background:#142138;color:#b7c2d4}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.healthy,.active{color:var(--green)}.unhealthy,.expired,.revoked{color:var(--red)}.unused,.unknown,.warning{color:var(--amber)}.tag{display:inline-block;padding:2px 7px;margin:2px;border:1px solid #415779;border-radius:999px;color:#bed0ec}.row-details{margin-top:7px}.row-details>summary,.menu>summary{cursor:pointer;color:#a9c6ff}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 12px;background:var(--panel2);padding:9px;border-radius:8px;margin-top:6px}.menu{position:relative;display:inline-block}.menu-body{position:absolute;right:0;z-index:5;min-width:150px;padding:7px;background:#17243a;border:1px solid var(--line);border-radius:9px;box-shadow:0 12px 30px #0008}.menu-body button{width:100%;margin:2px 0;text-align:left}.cards{display:none}.link-card{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:12px;margin:9px 0}.link-card-head{display:flex;justify-content:space-between;gap:10px}.toast-area{position:fixed;right:18px;bottom:18px;z-index:20;display:grid;gap:8px}.toast{max-width:min(420px,90vw);background:#182842;border:1px solid #45618d;border-radius:10px;padding:11px 14px;box-shadow:0 12px 35px #0008}.toast.error{border-color:#a84357}.toast.partial{border-color:#98762e}.empty,.errorbox{text-align:center;padding:25px;color:var(--muted)}dialog{color:var(--text);background:#111c2e;border:1px solid var(--line);border-radius:14px;width:min(92vw,520px);padding:20px}dialog::backdrop{background:#0009}dialog h3{font-size:18px}.dialog-fields{display:grid;gap:8px}.audit-json{max-width:320px;white-space:pre-wrap;word-break:break-word;font-size:11px}.pool-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}.pool-card{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:11px}.loading{opacity:.7;pointer-events:none}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+@media(max-width:1000px){.stats{grid-template-columns:repeat(2,1fr)}.form-grid,.filters{grid-template-columns:repeat(2,1fr)}}@media(max-width:720px){.wrap{padding:13px}.grid{grid-template-columns:1fr}.stats{grid-template-columns:1fr 1fr}.filters,.form-grid{grid-template-columns:1fr}.desktop-links{display:none}.cards{display:block}.toolbar{align-items:stretch}.toolbar>*{flex:1 1 140px}.pagination{width:100%}.menu-body{position:fixed;left:14px;right:14px;bottom:14px}.detail-grid{grid-template-columns:1fr}}@media(max-width:420px){.stats{grid-template-columns:1fr}.top h1{font-size:22px}}
+</style></head><body><main class="wrap">
+<header class="top"><div><h1>限时访问链接</h1><div class="muted">真实连接时开始计时；限制、健康状态和会话均由 D1 原子维护</div></div><div class="actions"><a href="/admin">返回原后台</a><button class="ghost" id="logoutAll">退出所有设备</button></div></header>
+<section class="stats" id="stats" aria-label="运行概况"></section>
+<section class="grid"><form class="card" id="createForm"><h2>生成访问链接</h2><div class="notice">0 表示不限制。开启首次 IP 绑定后，首次真实连接的客户端 IP 将成为唯一允许 IP。</div><div class="form-grid"><label>国家<input name="country" list="countryOptions" placeholder="名称或代码" required></label><label>有效时长（小时）<input name="durationHours" list="durationOptions" value="3" required></label><label>数量（最多 100）<input name="count" type="number" min="1" max="100" value="1" required></label><label>备注<input name="note" maxlength="100"></label><label>并发上限<input name="maxConcurrentConnections" type="number" min="0" max="10000" value="0"></label><label>累计上限<input name="maxTotalConnections" type="number" min="0" max="10000000" value="0"></label><label>标签（逗号分隔）<input name="tags" maxlength="300"></label><label><span>客户端绑定</span><select name="bindFirstIp"><option value="0">不绑定</option><option value="1">绑定首次 IP</option></select></label></div><p><button>生成链接</button></p></form>
+<section class="card"><h2>运维与备份</h2><div class="notice" id="notifyState">通知配置读取中…</div><div class="actions"><button class="alt" data-export="json">导出筛选 JSON</button><button class="alt" data-export="csv">导出筛选 CSV</button><button class="alt" id="backupExport">导出 D1 备份</button><label class="ghost" style="padding:7px 10px;border:1px solid var(--line);border-radius:8px;cursor:pointer">恢复备份<input class="sr-only" id="backupFile" type="file" accept="application/json"></label></div><p class="muted">恢复默认仅插入不存在的数据；覆盖恢复会要求再次输入确认文本。</p></section></section>
+<datalist id="countryOptions">${国家选项HTML}</datalist><datalist id="durationOptions"><option value="1"><option value="3"><option value="8"><option value="24"><option value="72"><option value="permanent"></datalist>
+<section class="card" id="linksCard"><h2>访问链接</h2><form class="filters" id="filters"><label>搜索<input name="q" type="search" maxlength="100" placeholder="ID / 备注 / UUID / IP"></label><label>状态<select name="status"><option value="all">全部</option><option value="unused">未使用</option><option value="active">使用中</option><option value="expired">已过期</option><option value="revoked">已停用</option></select></label><label>国家<input name="country" list="countryOptions" placeholder="全部"></label><label>标签<input name="tag" maxlength="30"></label><label>到期<select name="expiry"><option value="all">全部</option><option value="24h">24 小时内</option><option value="7d">7 天内</option><option value="expired">已过期</option></select></label><button>应用筛选</button></form>
+<div class="toolbar"><label><input id="selectAll" type="checkbox" style="width:auto"> 本页全选</label><span id="selectedCount" class="muted">已选 0 条</span><select id="bulkAction" aria-label="批量操作"><option value="">批量操作…</option><option value="revoke">停用</option><option value="restore">恢复</option><option value="renew">续期</option><option value="reset">重置计时</option><option value="reassign">重选 IP</option><option value="tags">修改标签</option><option value="rotate">轮换凭据</option><option value="delete">删除</option></select><button id="runBulk" disabled>执行</button><span style="flex:1"></span><label>每页<select id="pageSize"><option>10</option><option selected>20</option><option>50</option></select></label><div class="pagination"><button class="small alt" data-page="prev">上一页</button><span id="pageInfo" class="muted"></span><button class="small alt" data-page="next">下一页</button></div></div>
+<div class="tablewrap desktop-links"><table><thead><tr><th></th><th>ID / 备注</th><th>国家</th><th>状态</th><th>剩余时间</th><th>最后使用</th><th>当前 / 累计</th><th>PROXYIP</th><th>操作</th></tr></thead><tbody id="links"></tbody></table></div><div class="cards" id="linkCards"></div></section>
+<section class="card"><h2>国家 PROXYIP 健康</h2><div class="pool-grid" id="poolStats"></div><details><summary>最近 500 条 IP</summary><div class="tablewrap"><table><thead><tr><th>国家</th><th>PROXYIP</th><th>健康</th><th>评分</th><th>延迟</th><th>真实成功 / 失败</th><th>最后检测</th></tr></thead><tbody id="pools"></tbody></table></div></details></section>
+<section class="card"><h2>数据源</h2><div class="actions"><form id="syncForm" class="actions"><input name="country" list="countryOptions" placeholder="国家" required><button>同步并检测</button></form></div><details><summary>手动添加 IP / 数据源</summary><div class="grid"><form id="poolForm"><label>国家<input name="country" list="countryOptions" required></label><label>PROXYIP<textarea name="proxyIps" required></textarea></label><button>加入 IP 池</button></form><form id="sourceForm"><label>名称<input name="name" maxlength="80" required></label><label>HTTPS 地址<input name="url" type="url" required></label><label>默认国家<input name="defaultCountry" list="countryOptions"></label><label>刷新分钟<input name="refreshMinutes" type="number" min="5" max="1440" value="60"></label><label>每国上限<input name="maxPerCountry" type="number" min="10" max="200" value="100"></label><button>保存数据源</button></form></div></details><div class="tablewrap"><table><thead><tr><th>名称</th><th>地址</th><th>状态</th><th>失败次数</th><th>操作</th></tr></thead><tbody id="sources"></tbody></table></div></section>
+<section class="card"><h2>安全审计</h2><form class="toolbar" id="auditFilters"><input name="q" placeholder="操作 / 对象 / 错误"><input name="action" placeholder="精确操作类型"><button>筛选</button><button type="button" class="alt" data-audit-export="json">JSON</button><button type="button" class="alt" data-audit-export="csv">CSV</button></form><div class="tablewrap"><table><thead><tr><th>时间</th><th>操作</th><th>对象</th><th>来源</th><th>结果</th><th>摘要</th></tr></thead><tbody id="audit"></tbody></table></div><div class="pagination"><button class="small alt" data-audit-page="prev">上一页</button><span id="auditPage" class="muted"></span><button class="small alt" data-audit-page="next">下一页</button></div></section>
+</main><div class="toast-area" id="toasts" aria-live="polite"></div>
+<dialog id="actionDialog"><form method="dialog" id="actionForm"><h3 id="dialogTitle">确认操作</h3><p id="dialogMessage"></p><div class="dialog-fields" id="dialogFields"></div><div class="actions" style="margin-top:16px"><button value="cancel" class="alt">取消</button><button value="confirm" id="dialogConfirm">确认</button></div></form></dialog>
+<script>
+const $=s=>document.querySelector(s),$$=s=>Array.from(document.querySelectorAll(s));
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=v=>v?new Date(Number(v)).toLocaleString():'—';
+const csrf=()=>decodeURIComponent((document.cookie.split('; ').find(x=>x.startsWith('admin_csrf='))||'=').split('=').slice(1).join('='));
+function toast(message,type){const n=document.createElement('div');n.className='toast '+(type||'');n.textContent=message;$('#toasts').append(n);setTimeout(()=>n.remove(),5000)}
+async function api(path,options){options=options||{};const headers=new Headers(options.headers||{});if(options.method&&options.method!=='GET'){headers.set('Content-Type','application/json');headers.set('X-CSRF-Token',csrf())}const r=await fetch('/admin/access/api/'+path,{...options,headers});const j=await r.json().catch(()=>({error:'响应格式错误'}));if(!r.ok&&r.status!==207||j.success===false)throw new Error(j.error||'请求失败');return j}
+async function download(path,filename,confirmation){const r=await fetch('/admin/access/api/'+path,{headers:{'X-Export-Confirmation':confirmation}});if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||'导出失败')}const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=filename;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+let page=1,pageSize=20,total=0,links=[],selected=new Set(),filters={},auditPage=1,auditTotal=0,auditFilter={};
+const statusNames={unused:'未使用',active:'使用中',expired:'已过期',revoked:'已停用'};
+function remaining(x){if(Number(x.duration_seconds)===0&&!x.expires_at)return '永久';if(!x.expires_at)return '未开始';const ms=Number(x.expires_at)-Date.now();if(ms<=0)return '已过期';const d=Math.floor(ms/86400000),h=Math.floor(ms%86400000/3600000),m=Math.floor(ms%3600000/60000),s=Math.floor(ms%60000/1000);return (d?d+'天 ':'')+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}
+function actionMenu(x){const primary=x.display_status==='expired'?'<button class="small" data-action="renew" data-id="'+x.id+'">续期</button>':x.status==='active'?'<button class="small danger" data-action="revoke" data-id="'+x.id+'">停用</button>':'<button class="small" data-action="restore" data-id="'+x.id+'">恢复</button>';return primary+'<details class="menu"><summary>更多</summary><div class="menu-body"><button data-action="edit" data-id="'+x.id+'">编辑限制/标签</button><button data-action="renew" data-id="'+x.id+'">续期</button><button data-action="reset" data-id="'+x.id+'">重置计时</button><button data-action="reassign" data-id="'+x.id+'">重选 IP</button><button data-action="rotate" data-id="'+x.id+'">轮换凭据</button><button data-copy="'+esc(x.subscription_url)+'">复制订阅</button><button data-copy="'+esc(x.node_url)+'">复制节点</button><button class="danger" data-action="delete" data-id="'+x.id+'">删除</button></div></details>'}
+function details(x){const tagHtml=(x.tags_list||[]).map(t=>'<span class="tag">'+esc(t)+'</span>').join('')||'—';return '<details class="row-details"><summary>详情</summary><div class="detail-grid"><span>UUID</span><span class="mono">'+esc(x.uuid)+'</span><span>首次使用</span><span>'+fmt(x.first_used_at)+'</span><span>完整到期</span><span>'+fmt(x.expires_at)+'</span><span>限制</span><span>并发 '+Number(x.max_concurrent_connections||0)+' / 累计 '+Number(x.max_total_connections||0)+'</span><span>绑定</span><span>'+(Number(x.bind_first_ip)?(x.bound_ip?'已绑定':'等待首次 IP'):'未启用')+'</span><span>标签</span><span>'+tagHtml+'</span></div></details>'}
+function renderLinks(){const rows=links.map(x=>'<tr><td><input type="checkbox" data-select="'+x.id+'" '+(selected.has(Number(x.id))?'checked':'')+' aria-label="选择链接 '+x.id+'"></td><td><b>#'+x.id+'</b><br>'+esc(x.note||'—')+details(x)+'</td><td>'+esc(x.country)+'</td><td class="'+esc(x.display_status)+'">'+statusNames[x.display_status]+'</td><td data-countdown="'+(x.expires_at||'')+'">'+remaining(x)+'</td><td>'+fmt(x.last_used_at)+'</td><td>'+Number(x.active_connections||0)+' / '+Number(x.connection_count||0)+'</td><td class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'</td><td>'+actionMenu(x)+'</td></tr>').join('');$('#links').innerHTML=rows||'<tr><td colspan="9" class="empty">没有符合条件的链接</td></tr>';$('#linkCards').innerHTML=links.map(x=>'<article class="link-card"><div class="link-card-head"><label><input type="checkbox" data-select="'+x.id+'" '+(selected.has(Number(x.id))?'checked':'')+'> <b>#'+x.id+' '+esc(x.note||'')+'</b></label><span class="'+x.display_status+'">'+statusNames[x.display_status]+'</span></div><p>'+esc(x.country)+' · <span data-countdown="'+(x.expires_at||'')+'">'+remaining(x)+'</span><br>连接 '+Number(x.active_connections||0)+' / '+Number(x.connection_count||0)+'<br><span class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'</span></p>'+details(x)+'<div class="actions">'+actionMenu(x)+'</div></article>').join('')||'<div class="empty">没有符合条件的链接</div>';updateSelection()}
+function updateSelection(){$$('[data-select]').forEach(b=>b.checked=selected.has(Number(b.dataset.select)));$('#selectedCount').textContent='已选 '+selected.size+' 条';$('#runBulk').disabled=!selected.size||!$('#bulkAction').value;$('#selectAll').checked=links.length>0&&links.every(x=>selected.has(Number(x.id)));$('#selectAll').indeterminate=links.some(x=>selected.has(Number(x.id)))&&!links.every(x=>selected.has(Number(x.id)))}
+async function load(){const card=$('#linksCard');card.classList.add('loading');try{const p=new URLSearchParams({...filters,limit:pageSize,offset:(page-1)*pageSize});const d=await api('state?'+p);links=d.links||[];total=Number(d.pagination.total||0);const pages=Math.max(1,Math.ceil(total/pageSize));if(page>pages){page=pages;return load()}const s=d.stats||{};$('#stats').innerHTML=[['当前连接',s.current_connections||0],['24 小时连接',(s.connections_24h||0)+' / 失败 '+(s.failure_rate_24h||0)+'%'],['健康 IP',(s.healthy_ip_ratio||0)+'%'],['低容量国家',s.low_capacity_countries||0],['链接总数',s.total||0]].map(v=>'<div class="stat"><b>'+v[1]+'</b><span>'+v[0]+'</span></div>').join('');$('#notifyState').textContent=d.security&&d.security.notifications_configured?'Webhook / Telegram 通知已配置':'通知未配置，不影响链接与健康检查';selected=new Set(Array.from(selected).filter(id=>links.some(x=>Number(x.id)===id)));renderLinks();$('#pageInfo').textContent='第 '+page+' / '+pages+' 页 · '+total+' 条';$$('[data-page="prev"]').forEach(b=>b.disabled=page<=1);$$('[data-page="next"]').forEach(b=>b.disabled=page>=pages);renderPools(d);await loadAudit()}catch(e){toast(e.message,'error');$('#links').innerHTML='<tr><td colspan="9" class="errorbox">加载失败：'+esc(e.message)+'</td></tr>'}finally{card.classList.remove('loading')}}
+function renderPools(d){$('#poolStats').innerHTML=(d.poolStats||[]).map(x=>'<article class="pool-card"><b>'+esc(x.country)+'</b><div>健康 '+Number(x.healthy||0)+' / '+Number(x.total||0)+' · 隔离 '+Number(x.isolated||0)+'</div><div>分配 '+Number(x.assigned||0)+' · 延迟 '+(x.average_latency_ms==null?'—':x.average_latency_ms+' ms')+'</div><div class="'+(Number(x.healthy)<Number(x.min_healthy_ips)?'warning':'healthy')+'">阈值 '+Number(x.min_healthy_ips)+' · 评分 '+Number(x.average_health_score||0)+'</div><div class="actions"><button class="small" data-sync-country="'+esc(x.country)+'">同步</button><button class="small alt" data-check-country="'+esc(x.country)+'">检测</button><button class="small alt" data-threshold-country="'+esc(x.country)+'" data-threshold="'+Number(x.min_healthy_ips)+'">阈值</button></div></article>').join('')||'<div class="empty">还没有国家 IP 池</div>';$('#pools').innerHTML=(d.pools||[]).map(x=>'<tr><td>'+esc(x.country)+'</td><td class="mono">'+esc(x.proxy_ip)+'</td><td class="'+esc(x.health_status||'unknown')+'">'+esc(x.health_status||'unknown')+(x.cooldown_until&&Number(x.cooldown_until)>Date.now()?'（隔离）':'')+'</td><td>'+Number(x.health_score||0)+'</td><td>'+(x.latency_ms==null?'—':Number(x.latency_ms)+' ms')+'</td><td>'+Number(x.real_success_count||0)+' / '+Number(x.real_failure_count||0)+'</td><td>'+fmt(x.last_checked_at)+'</td></tr>').join('');$('#sources').innerHTML=(d.sources||[]).map(x=>'<tr><td>'+esc(x.name)+'</td><td class="mono">'+esc(String(x.url).slice(0,90))+'</td><td class="'+(x.last_status==='error'?'unhealthy':x.last_status==='success'?'healthy':'unknown')+'">'+esc(x.last_status)+(x.last_error?'<br>'+esc(x.last_error):'')+'</td><td>'+Number(x.consecutive_failures||0)+'</td><td><button class="small alt" data-source-id="'+x.id+'" data-source-action="'+(x.enabled?'disable':'enable')+'">'+(x.enabled?'停用':'启用')+'</button>'+(String(x.url).includes('zip.cm.edu.kg')?'':'<button class="small danger" data-source-id="'+x.id+'" data-source-action="delete">删除</button>')+'</td></tr>').join('')}
+async function loadAudit(){const p=new URLSearchParams({...auditFilter,limit:20,offset:(auditPage-1)*20}),d=await api('audit?'+p);auditTotal=Number(d.pagination.total||0);$('#audit').innerHTML=(d.logs||[]).map(x=>'<tr><td>'+fmt(x.created_at)+'</td><td>'+esc(x.action)+'</td><td>'+esc(x.object_type)+' #'+esc(x.object_id)+'</td><td>'+esc(x.source_ip||'未记录')+(x.source_asn?' / AS'+esc(x.source_asn):'')+'</td><td class="'+(x.success?'healthy':'unhealthy')+'">'+(x.success?'成功':'失败：'+esc(x.error_message))+'</td><td><details><summary>查看</summary><pre class="audit-json">'+esc(x.before_summary||'')+'\n→\n'+esc(x.after_summary||'')+'</pre></details></td></tr>').join('')||'<tr><td colspan="6" class="empty">暂无审计记录</td></tr>';$('#auditPage').textContent='第 '+auditPage+' / '+Math.max(1,Math.ceil(auditTotal/20))+' 页'}
+function confirmDialog(title,message,fields){return new Promise(resolve=>{const d=$('#actionDialog'),f=$('#actionForm'),box=$('#dialogFields');$('#dialogTitle').textContent=title;$('#dialogMessage').textContent=message;box.innerHTML=fields||'';d.showModal();f.onsubmit=e=>{e.preventDefault();const value=e.submitter&&e.submitter.value;if(value!=='confirm'){d.close();resolve(null);return}const data=Object.fromEntries(new FormData(f));d.close();resolve(data)}})}
+function actionSpec(action,x,count){const n=count||1,m={revoke:['停用链接','将禁止新连接；本实例连接立即关闭，其他实例最长约 30 秒发现并断开。',''],restore:['恢复链接','仅恢复已停用且尚未过期的链接；已过期链接请续期。',''],renew:['续期','从当前到期时间或当前时间（较晚者）起增加时长，并恢复为可用。','<label>增加小时数<input name="hours" type="number" min="1" max="8760" value="24" required></label>'],reset:['重置计时','清除首次使用、到期、已分配 IP、绑定和全部使用统计；下一次真实连接重新计时。',''],reassign:['重选 IP','只更换 PROXYIP，不重置计时、绑定或使用统计。',''],rotate:['轮换凭据','旧凭据立即不能建立新连接；国家、IP、计时和统计保持不变。','<label>轮换范围<select name="mode"><option value="both">Token 和 UUID</option><option value="token">仅 Token</option><option value="uuid">仅 UUID</option></select></label>'],delete:['删除链接','永久删除 '+n+' 条链接及其连接事件，无法撤销。',''],tags:['修改标签','为 '+n+' 条链接设置相同标签。','<label>标签（逗号分隔）<input name="tags" maxlength="300"></label>']};if(action==='edit')return ['编辑链接','修改备注、标签、连接限制和首次 IP 绑定。','<label>备注<input name="note" maxlength="200" value="'+esc(x.note||'')+'"></label><label>标签<input name="tags" value="'+esc((x.tags_list||[]).join(','))+'"></label><label>并发上限<input name="maxConcurrentConnections" type="number" min="0" max="10000" value="'+Number(x.max_concurrent_connections||0)+'"></label><label>累计上限<input name="maxTotalConnections" type="number" min="0" max="10000000" value="'+Number(x.max_total_connections||0)+'"></label><label>首次 IP 绑定<select name="bindFirstIp"><option value="0" '+(!Number(x.bind_first_ip)?'selected':'')+'>关闭</option><option value="1" '+(Number(x.bind_first_ip)?'selected':'')+'>开启</option></select></label>'];return m[action]}
+async function runAction(action,ids,x){const spec=actionSpec(action,x,ids.length);if(!spec)return;const extra=await confirmDialog(spec[0],spec[1],spec[2]);if(!extra)return;const payload={action,...extra};if(ids.length===1)payload.id=ids[0];else payload.ids=ids;$('#linksCard').classList.add('loading');try{const d=await api('links/action',{method:'POST',body:JSON.stringify(payload)});toast(d.message,d.partial?'partial':'');selected.clear();await load()}finally{$('#linksCard').classList.remove('loading')}}
+$('#filters').addEventListener('submit',e=>{e.preventDefault();filters=Object.fromEntries(new FormData(e.target));page=1;selected.clear();load()});
+$('#createForm').addEventListener('submit',async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const d=await api('links',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});toast(d.message);page=1;await load()}catch(x){toast(x.message,'error')}finally{b.disabled=false}});
+$('#syncForm').addEventListener('submit',async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const d=await api('pools/sync',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});toast(d.message);await load()}catch(x){toast(x.message,'error')}finally{b.disabled=false}});
+for(const id of ['poolForm','sourceForm'])$('#'+id).addEventListener('submit',async e=>{e.preventDefault();const path=id==='poolForm'?'pools':'sources',b=e.submitter;b.disabled=true;try{const d=await api(path,{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});toast(d.message);await load()}catch(x){toast(x.message,'error')}finally{b.disabled=false}});
+$('#auditFilters').addEventListener('submit',e=>{e.preventDefault();auditFilter=Object.fromEntries(new FormData(e.target));auditPage=1;loadAudit()});
+$('#selectAll').addEventListener('change',e=>{links.forEach(x=>e.target.checked?selected.add(Number(x.id)):selected.delete(Number(x.id)));updateSelection()});
+$('#bulkAction').addEventListener('change',updateSelection);$('#runBulk').addEventListener('click',()=>runAction($('#bulkAction').value,Array.from(selected),null));
+$('#pageSize').addEventListener('change',e=>{pageSize=Number(e.target.value);page=1;selected.clear();load()});
+$('#logoutAll').addEventListener('click',async()=>{const d=await confirmDialog('退出所有设备','将撤销包括当前设备在内的全部管理员会话。','');if(!d)return;try{await api('session/logout-all',{method:'POST',body:'{}'});location.href='/login'}catch(x){toast(x.message,'error')}});
+$$('[data-export]').forEach(b=>b.addEventListener('click',async()=>{const ok=await confirmDialog('导出敏感链接','导出包含完整 Token、UUID 和可用访问链接。请只保存到可信设备。','');if(!ok)return;try{const p=new URLSearchParams({...filters,format:b.dataset.export});await download('links/export?'+p,'edgetunnel-access-links.'+b.dataset.export,'include-sensitive-links')}catch(x){toast(x.message,'error')}}));
+$('#backupExport').addEventListener('click',async()=>{const ok=await confirmDialog('导出 D1 备份','备份包含访问凭据和 IP 池，但不包含管理员会话。','');if(ok)try{await download('backup','edgetunnel-d1-backup.json','backup-operational-data')}catch(x){toast(x.message,'error')}});
+$('#backupFile').addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;try{const data=JSON.parse(await file.text());let mode='merge',confirmOverwrite='';const first=await confirmDialog('恢复 D1 备份','默认不覆盖现有数据。勾选后将覆盖相同主键记录。','<label><select name="mode"><option value="merge">仅合并，不覆盖</option><option value="overwrite">覆盖相同记录</option></select></label>');if(!first)return;mode=first.mode;if(mode==='overwrite'){const second=await confirmDialog('二次确认覆盖','输入 RESTORE OVERWRITE 才会执行覆盖恢复。','<label>确认文本<input name="confirmOverwrite" required></label>');if(!second)return;confirmOverwrite=second.confirmOverwrite}const d=await api('backup/restore',{method:'POST',body:JSON.stringify({...data,mode,confirmOverwrite})});toast(d.message,d.partial?'partial':'');await load()}catch(x){toast(x.message,'error')}finally{e.target.value=''}});
+$$('[data-audit-export]').forEach(b=>b.addEventListener('click',()=>download('audit/export?format='+b.dataset.auditExport,'edgetunnel-audit.'+b.dataset.auditExport,'')));
+document.addEventListener('change',e=>{if(e.target.matches('[data-select]')){const id=Number(e.target.dataset.select);e.target.checked?selected.add(id):selected.delete(id);updateSelection()}});
+document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;b.disabled=true;try{if(b.dataset.copy){await navigator.clipboard.writeText(b.dataset.copy);toast('已复制到剪贴板')}else if(b.dataset.action){const x=links.find(v=>Number(v.id)===Number(b.dataset.id));await runAction(b.dataset.action,[Number(b.dataset.id)],x)}else if(b.dataset.page){page+=b.dataset.page==='next'?1:-1;selected.clear();await load()}else if(b.dataset.auditPage){auditPage=Math.max(1,auditPage+(b.dataset.auditPage==='next'?1:-1));await loadAudit()}else if(b.dataset.syncCountry){const d=await api('pools/sync',{method:'POST',body:JSON.stringify({country:b.dataset.syncCountry})});toast(d.message);await load()}else if(b.dataset.checkCountry){const d=await api('pools/check',{method:'POST',body:JSON.stringify({country:b.dataset.checkCountry,limit:8})});toast(d.message);await load()}else if(b.dataset.thresholdCountry){const v=await confirmDialog('健康 IP 阈值',b.dataset.thresholdCountry+' 低于此数量时触发警告和通知。','<label>最低健康 IP<input name="minimum" type="number" min="1" max="100" value="'+b.dataset.threshold+'" required></label>');if(v){const d=await api('health/threshold',{method:'POST',body:JSON.stringify({country:b.dataset.thresholdCountry,minimum:v.minimum})});toast(d.message);await load()}}else if(b.dataset.sourceAction){if(b.dataset.sourceAction==='delete'&&!await confirmDialog('删除数据源','将同时删除该来源导入的 IP。',''))return;const d=await api('sources/action',{method:'POST',body:JSON.stringify({id:Number(b.dataset.sourceId),action:b.dataset.sourceAction})});toast(d.message);await load()}}catch(x){toast(x.message,'error')}finally{b.disabled=false}});
+setInterval(()=>$$('[data-countdown]').forEach(n=>{const x=links.find(v=>String(v.expires_at||'')===n.dataset.countdown);if(x)n.textContent=remaining(x)}),1000);load();
+</script></body></html>`;
+	return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" } });
 }
 
 function 访问链接管理页面() {
@@ -1535,8 +2424,8 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 			try {
 				if (首包.isUDP) {
 					if (首包.rawData?.byteLength) {
-						if (首包.协议 === 'trojan') await 转发木马UDP数据(首包.rawData, xhttpBridge, 木马UDP上下文, request);
-						else await forwardataudp(首包.rawData, xhttpBridge, udpRespHeader, request);
+						if (首包.协议 === 'trojan') await 转发木马UDP数据(首包.rawData, xhttpBridge, 木马UDP上下文, request, 访问授权上下文);
+						else await forwardataudp(首包.rawData, xhttpBridge, udpRespHeader, request, null, 访问授权上下文);
 						udpRespHeader = null;
 					}
 				} else {
@@ -1548,8 +2437,8 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 					if (done) break;
 					if (!value || value.byteLength === 0) continue;
 					if (首包.isUDP) {
-						if (首包.协议 === 'trojan') await 转发木马UDP数据(value, xhttpBridge, 木马UDP上下文, request);
-						else await forwardataudp(value, xhttpBridge, udpRespHeader, request);
+						if (首包.协议 === 'trojan') await 转发木马UDP数据(value, xhttpBridge, 木马UDP上下文, request, 访问授权上下文);
+						else await forwardataudp(value, xhttpBridge, udpRespHeader, request, null, 访问授权上下文);
 						udpRespHeader = null;
 					} else {
 						if (!(await 写入远端(value))) throw new Error('Remote socket is not ready');
@@ -1571,6 +2460,7 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 				上行写入队列.清空();
 				释放远端写入器();
 				try { reader.releaseLock() } catch (e) { }
+				await 结束访问授权上下文(访问授权上下文, 访问授权上下文?.代理连接成功, 访问授权上下文?.代理连接成功 ? '' : 'upstream_failed');
 			}
 		},
 		cancel() {
@@ -1578,6 +2468,7 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			释放远端写入器();
 			try { reader.releaseLock() } catch (e) { }
+			结束访问授权上下文(访问授权上下文, 访问授权上下文?.代理连接成功, 'client_cancelled');
 		}
 	}), { status: 200, headers: responseHeaders });
 }
@@ -1934,8 +2825,8 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null)
 						}
 						if (!payload.byteLength) continue;
 						if (isDnsQuery) {
-							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
-							else await forwardataudp(payload, grpcBridge, null, request);
+							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request, 访问授权上下文);
+							else await forwardataudp(payload, grpcBridge, null, request, null, 访问授权上下文);
 							continue;
 						}
 						if (remoteConnWrapper.socket) {
@@ -1947,15 +2838,15 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null)
 								const 解析结果 = 解析木马请求(首包bytes, yourUUID);
 								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
 								const { port, hostname, rawClientData, isUDP } = 解析结果;
+								if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 								if (访问授权上下文) {
 									await 激活访问授权上下文(访问授权上下文);
 									安排访问链接到期(访问授权上下文, 关闭连接);
 								}
 								log(`[gRPC] 木马首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
-								if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 								if (isUDP) {
 									isDnsQuery = true;
-									if (有效数据长度(rawClientData) > 0) await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request);
+									if (有效数据长度(rawClientData) > 0) await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request, 访问授权上下文);
 								} else {
 									await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
 								}
@@ -1964,22 +2855,22 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null)
 								const 解析结果 = 解析魏烈思请求(首包bytes, yourUUID);
 								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
 								const { port, hostname, version, isUDP, rawClientData } = 解析结果;
+								if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
+								if (isUDP && port !== 53) throw new Error('UDP is not supported');
 								if (访问授权上下文) {
 									await 激活访问授权上下文(访问授权上下文);
 									安排访问链接到期(访问授权上下文, 关闭连接);
 								}
 								log(`[gRPC] 魏烈思首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
-								if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 								if (isUDP) {
-									if (port !== 53) throw new Error('UDP is not supported');
 									isDnsQuery = true;
 								}
 								const respHeader = new Uint8Array([version, 0]);
 								grpcBridge.send(respHeader);
 								const rawData = rawClientData;
 								if (isDnsQuery) {
-									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
-									else await forwardataudp(rawData, grpcBridge, null, request);
+									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request, 访问授权上下文);
+									else await forwardataudp(rawData, grpcBridge, null, request, null, 访问授权上下文);
 								}
 								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
 							}
@@ -1994,12 +2885,14 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null)
 				上行写入队列.清空();
 				释放远端写入器();
 				关闭连接();
+				await 结束访问授权上下文(访问授权上下文, 访问授权上下文?.代理连接成功, 访问授权上下文?.代理连接成功 ? '' : 'upstream_failed');
 			}
 		},
 		cancel() {
 			GRPC上行写入队列?.清空();
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
+			结束访问授权上下文(访问授权上下文, 访问授权上下文?.代理连接成功, 'client_cancelled');
 		}
 	}), { status: 200, headers: grpcHeaders });
 }
@@ -2346,8 +3239,8 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 	const 处理WS入站数据 = async (chunk) => {
 		let 当前块字节 = null;
 		if (isDnsQuery) {
-			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
-			return await forwardataudp(chunk, serverSock, null, request);
+			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request, 访问授权上下文);
+			return await forwardataudp(chunk, serverSock, null, request, null, 访问授权上下文);
 		}
 		if (判断协议类型 === 'ss') {
 			await 处理SS数据(chunk);
@@ -2382,7 +3275,7 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 			}
 			if (isUDP) {
 				isDnsQuery = true;
-				if (有效数据长度(rawClientData) > 0) return 转发木马UDP数据(rawClientData, serverSock, 木马UDP上下文, request);
+				if (有效数据长度(rawClientData) > 0) return 转发木马UDP数据(rawClientData, serverSock, 木马UDP上下文, request, 访问授权上下文);
 				return;
 			}
 			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
@@ -2394,19 +3287,19 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
 			const { port, hostname, version, isUDP, rawClientData } = 解析结果;
 			if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
+			if (isUDP && port !== 53) throw new Error('UDP is not supported');
 			if (访问授权上下文) {
 				await 激活访问授权上下文(访问授权上下文);
 				安排访问链接到期(访问授权上下文, () => closeSocketQuietly(serverSock));
 			}
 			if (isUDP) {
-				if (port === 53) isDnsQuery = true;
-				else throw new Error('UDP is not supported');
+				isDnsQuery = true;
 			}
 			const respHeader = new Uint8Array([version, 0]);
 			const rawData = rawClientData;
 			if (isDnsQuery) {
-				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
-				return forwardataudp(rawData, serverSock, respHeader, request);
+				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request, 访问授权上下文);
+				return forwardataudp(rawData, serverSock, respHeader, request, null, 访问授权上下文);
 			}
 			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
 		}
@@ -2427,6 +3320,7 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 		上行写入队列.清空();
 		释放远端写入器();
 		closeSocketQuietly(serverSock);
+		结束访问授权上下文(访问授权上下文, 访问授权上下文?.代理连接成功, 'transport_error');
 	};
 
 	const 追加WS显式传输任务 = (任务) => {
@@ -2470,9 +3364,11 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 	serverSock.addEventListener('close', () => {
 		closeSocketQuietly(serverSock);
 		收尾WS显式传输();
+		结束访问授权上下文(访问授权上下文, 访问授权上下文?.代理连接成功, 'client_closed');
 	});
 	serverSock.addEventListener('error', (err) => {
 		处理WS显式传输错误(err);
+		结束访问授权上下文(访问授权上下文, false, 'websocket_error');
 	});
 
 	// SS 模式下禁用 sec-websocket-protocol early-data，避免把子协议值（如 "binary"）误当作 base64 数据注入首包导致 AEAD 解密失败。
@@ -2672,7 +3568,7 @@ function 拼接字节数据(...chunkList) {
 	return result;
 }
 
-async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {
+async function 转发木马UDP数据(chunk, webSocket, 上下文, request, 访问授权上下文 = null) {
 	const 当前块 = 数据转Uint8Array(chunk);
 	const 缓存块 = 上下文?.缓存 instanceof Uint8Array ? 上下文.缓存 : new Uint8Array(0);
 	const input = 缓存块.byteLength ? 拼接字节数据(缓存块, 当前块) : 当前块;
@@ -2806,6 +3702,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const 当前启用SOCKS5反代 = 请求反代上下文?.启用SOCKS5反代 ?? 启用SOCKS5反代;
 	const 当前启用SOCKS5全局反代 = 请求反代上下文?.启用SOCKS5全局反代 ?? 启用SOCKS5全局反代;
 	const 当前parsedSocks5Address = 请求反代上下文?.parsedSocks5Address ?? parsedSocks5Address;
+	const 当前访问授权上下文 = 请求反代上下文?.访问授权上下文 || null;
 	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${当前反代IP} | 反代兜底: ${当前启用反代兜底 ? '是' : '否'} | 反代类型: ${当前启用SOCKS5反代 || 'proxyip'} | 全局: ${当前启用SOCKS5全局反代 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
 	let 已通过代理发送首包 = false;
@@ -2836,15 +3733,31 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		finally { try { writer.releaseLock() } catch (e) { } }
 	}
 
-	async function 并发打开候选连接(候选列表) {
+	async function 并发打开候选连接(候选列表, 记录代理健康 = false) {
 		if (候选列表.length === 1) {
 			const 候选 = 候选列表[0];
-			return { socket: await 打开TCP连接(候选.hostname, 候选.port), candidate: 候选 };
+			const startedAt = Date.now();
+			try {
+				const result = { socket: await 打开TCP连接(候选.hostname, 候选.port), candidate: 候选 };
+				if (记录代理健康 && 当前访问授权上下文) await 记录访问代理连接结果(当前访问授权上下文, true, 候选.port === 443 ? 候选.hostname : `${候选.hostname}:${候选.port}`, Date.now() - startedAt);
+				return result;
+			} catch (error) {
+				if (记录代理健康 && 当前访问授权上下文) await 记录访问代理连接结果(当前访问授权上下文, false, 候选.port === 443 ? 候选.hostname : `${候选.hostname}:${候选.port}`, null, error?.message || error);
+				throw error;
+			}
 		}
-		const attempts = 候选列表.map(候选 => 打开TCP连接(候选.hostname, 候选.port).then(socket => ({ socket, candidate: 候选 })));
+		const attempts = 候选列表.map(async 候选 => {
+			const startedAt = Date.now();
+			try { return { socket: await 打开TCP连接(候选.hostname, 候选.port), candidate: 候选, latency: Date.now() - startedAt } }
+			catch (error) {
+				if (记录代理健康 && 当前访问授权上下文) await 记录访问代理连接结果(当前访问授权上下文, false, 候选.port === 443 ? 候选.hostname : `${候选.hostname}:${候选.port}`, null, error?.message || error);
+				throw error;
+			}
+		}, 访问授权上下文);
 		let winner = null;
 		try {
 			winner = await Promise.any(attempts);
+			if (记录代理健康 && 当前访问授权上下文) await 记录访问代理连接结果(当前访问授权上下文, true, winner.candidate.port === 443 ? winner.candidate.hostname : `${winner.candidate.hostname}:${winner.candidate.port}`, winner.latency);
 			return winner;
 		} finally {
 			if (winner) {
@@ -2871,7 +3784,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				let socket = null, candidate = null;
 				try {
 					log(`[反代连接] 并发尝试 ${候选列表.length} 路: ${候选列表.map(候选 => `${候选.hostname}:${候选.port}`).join(', ')}`);
-					const 连接结果 = await 并发打开候选连接(候选列表);
+					const 连接结果 = await 并发打开候选连接(候选列表, !!当前访问授权上下文);
 					socket = 连接结果.socket;
 					candidate = 连接结果.candidate;
 					await 写入首包(socket, data);
@@ -2976,6 +3889,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		try {
 			log(`[TCP转发] 尝试直连到: ${host}:${portNum}`);
 			const initialSocket = await connectDirect(host, portNum, rawData);
+			if (当前访问授权上下文) 当前访问授权上下文.代理连接成功 = true;
 			remoteConnWrapper.socket = initialSocket;
 			connectStreams(initialSocket, ws, respHeader, async () => {
 				if (remoteConnWrapper.socket !== initialSocket) return;
@@ -2988,7 +3902,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 }
 
-async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
+async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, 访问授权上下文 = null) {
 	const 请求数据 = 数据转Uint8Array(udpChunk);
 	const 请求字节数 = 请求数据.byteLength;
 	log(`[UDP转发] 收到 DNS 请求: ${请求字节数}B -> 8.8.4.4:53`);
@@ -3023,6 +3937,7 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 				}
 			},
 		}));
+		if (访问授权上下文) 访问授权上下文.代理连接成功 = true;
 	} catch (error) {
 		log(`[UDP转发] DNS 转发失败: ${error?.message || error}`);
 	}
@@ -6817,3 +7732,23 @@ async function html1101(host, 访问IP) {
 </body>
 </html>`;
 }
+
+// 仅导出无副作用的关键规则，供 Node 自动化测试验证；Worker 默认导出保持不变。
+export const __test = Object.freeze({
+	获取访问记录状态错误,
+	访问限制错误,
+	模拟访问链接激活,
+	计算续期到期时间,
+	获取访问恢复错误,
+	模拟重置访问链接,
+	生成轮换访问凭据,
+	选择健康故障转移候选,
+	计算登录失败状态,
+	汇总批量操作结果,
+	标准化访问标签,
+	解析访问标签,
+	标准化访问数据源URL,
+	验证管理员修改请求,
+	SHA256十六进制,
+	生成随机访问令牌
+});

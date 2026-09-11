@@ -25,8 +25,20 @@ CREATE TABLE IF NOT EXISTS proxy_ip_pool (
   proxy_ip TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
+  source_id INTEGER,
+  health_status TEXT NOT NULL DEFAULT 'unknown',
+  latency_ms INTEGER,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  last_checked_at INTEGER,
+  last_success_at INTEGER,
+  last_error TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL DEFAULT 0,
   UNIQUE(country, proxy_ip)
 );
 
 CREATE INDEX IF NOT EXISTS idx_proxy_pool_country_enabled
   ON proxy_ip_pool(country, enabled);
+CREATE INDEX IF NOT EXISTS idx_proxy_pool_source
+  ON proxy_ip_pool(source_id);
+CREATE INDEX IF NOT EXISTS idx_proxy_pool_health
+  ON proxy_ip_pool(country, enabled, health_status, failure_count);
