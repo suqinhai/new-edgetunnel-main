@@ -58,11 +58,16 @@ export default {
 		}
 		const 请求用户ID = 访问授权上下文?.记录?.uuid || userID;
 		调试日志打印 = ['1', 'true'].includes(env.DEBUG) || 调试日志打印;
+		let 请求反代IP, 请求启用反代兜底 = true;
 		if (env.PROXYIP) {
 			const proxyIPs = await 整理成数组(env.PROXYIP);
-			反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
-			启用反代兜底 = false;
-		} else 反代IP = (request.cf.colo + '.PrOxYIp.CmLiUsSsS.nEt').toLowerCase();
+			请求反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+			请求启用反代兜底 = false;
+		} else 请求反代IP = (request.cf.colo + '.PrOxYIp.CmLiUsSsS.nEt').toLowerCase();
+		// 旧的订阅生成流程仍读取这两个默认值；实际隧道连接使用下面的请求级快照。
+		反代IP = 请求反代IP;
+		启用反代兜底 = 请求启用反代兜底;
+		let 请求反代上下文 = { 反代IP: 请求反代IP, 启用反代兜底: 请求启用反代兜底, 启用SOCKS5反代: null, 启用SOCKS5全局反代: false, parsedSocks5Address: {} };
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
 		if (缓存SOCKS5白名单 === null) {
 			if (env.GO2SOCKS5) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(await 整理成数组(env.GO2SOCKS5)))];
@@ -71,19 +76,19 @@ export default {
 		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {// 版本信息接口
 			return new Response(JSON.stringify({ Version: Number(String(访问管理增强版本 || Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
-			if (!访问授权上下文) await 反代参数获取(url, 请求用户ID);
+			if (!访问授权上下文) 请求反代上下文 = await 反代参数获取(url, 请求用户ID, 请求反代上下文);
 			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
-			return await 处理WS请求(request, 请求用户ID, url, 访问授权上下文);
+			return await 处理WS请求(request, 请求用户ID, url, 访问授权上下文, 请求反代上下文);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/XHTTP代理
-			if (!访问授权上下文) await 反代参数获取(url, 请求用户ID);
+			if (!访问授权上下文) 请求反代上下文 = await 反代参数获取(url, 请求用户ID, 请求反代上下文);
 			const referer = request.headers.get('Referer') || '';
 			const 命中XHTTP特征 = referer.includes('x_padding', 14) || referer.includes('x_padding=');
 			if (!命中XHTTP特征 && contentType.startsWith('application/grpc')) {
 				log(`[gRPC] 命中请求: ${url.pathname}${url.search}`);
-				return await 处理gRPC请求(request, 请求用户ID, 访问授权上下文);
+				return await 处理gRPC请求(request, 请求用户ID, 访问授权上下文, 请求反代上下文);
 			}
 			log(`[XHTTP] 命中请求: ${url.pathname}${url.search}`);
-			return await 处理XHTTP请求(request, 请求用户ID, 访问授权上下文);
+			return await 处理XHTTP请求(request, 请求用户ID, 访问授权上下文, 请求反代上下文);
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
 			if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
@@ -94,6 +99,7 @@ export default {
 			if (访问路径 === 'admin/access' || 访问路径.startsWith('admin/access/')) {
 				管理员会话 = await 验证管理员会话(request, env);
 				if (!管理员会话) {
+					if (访问路径.startsWith('admin/access/api/')) return 访问错误响应('管理员会话已失效，请重新登录', 401);
 					return new Response('重定向中...', { status: 302, headers: { 'Location': '/login', 'Cache-Control': 'no-store' } });
 				}
 				return await 处理访问链接管理请求(request, env, host, userID, UA, url, 管理员会话);
@@ -147,8 +153,8 @@ export default {
 						const startTime = Date.now();
 						let 检测代理响应;
 						try {
-							parsedSocks5Address = await 获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议));
-							const { username, password, hostname, port } = parsedSocks5Address;
+							const 检测代理地址 = await 获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议));
+							const { username, password, hostname, port } = 检测代理地址;
 							const 完整代理参数 = username && password ? `${username}:${password}@${hostname}:${port}` : `${hostname}:${port}`;
 							try {
 								const 检测主机 = 'cloudflare.com', 检测端口 = 443, encoder = new TextEncoder(), decoder = new TextDecoder();
@@ -156,14 +162,14 @@ export default {
 								let tcpSocket = null, tlsSocket = null;
 								try {
 									tcpSocket = 代理协议 === 'socks5'
-										? await socks5Connect(检测主机, 检测端口, new Uint8Array(0), TCP连接)
+										? await socks5Connect(检测主机, 检测端口, new Uint8Array(0), TCP连接, 检测代理地址)
 										: 代理协议 === 'turn'
-											? await turnConnect(parsedSocks5Address, 检测主机, 检测端口, TCP连接)
+											? await turnConnect(检测代理地址, 检测主机, 检测端口, TCP连接)
 											: 代理协议 === 'sstp'
-												? await sstpConnect(parsedSocks5Address, 检测主机, 检测端口, TCP连接)
+												? await sstpConnect(检测代理地址, 检测主机, 检测端口, TCP连接)
 												: (代理协议 === 'https' && isIPHostname(hostname)
-													? await httpsConnect(检测主机, 检测端口, new Uint8Array(0), TCP连接)
-													: await httpConnect(检测主机, 检测端口, new Uint8Array(0), 代理协议 === 'https', TCP连接));
+													? await httpsConnect(检测主机, 检测端口, new Uint8Array(0), TCP连接, 检测代理地址)
+													: await httpConnect(检测主机, 检测端口, new Uint8Array(0), 代理协议 === 'https', TCP连接, 检测代理地址));
 									if (!tcpSocket) throw new Error('无法连接到代理服务器');
 									tlsSocket = new TlsClient(tcpSocket, { serverName: 检测主机, insecure: true });
 									await tlsSocket.handshake();
@@ -1461,7 +1467,7 @@ async function 获取访问PROXYIP数据源内容(source, targetCountry = '') {
 	} finally { clearTimeout(timer); }
 }
 
-async function 同步单个访问PROXYIP数据源(env, source, targetCountry = '') {
+async function 同步单个访问PROXYIP数据源(env, source, targetCountry = '', 重置健康状态 = false) {
 	const now = Date.now();
 	try {
 		const text = await 获取访问PROXYIP数据源内容(source, targetCountry);
@@ -1478,8 +1484,13 @@ async function 同步单个访问PROXYIP数据源(env, source, targetCountry = '
 			await env.DB.batch(entries.slice(index, index + 50).map(entry => env.DB.prepare(`INSERT INTO proxy_ip_pool
 				(country, proxy_ip, enabled, created_at, source_id, health_status, failure_count, last_error, updated_at)
 				VALUES (?1, ?2, 1, ?3, ?4, 'unknown', 0, '', ?3)
-				ON CONFLICT(country, proxy_ip) DO UPDATE SET enabled = 1, source_id = ?4, updated_at = ?3`)
-				.bind(entry.country, entry.proxy_ip, now, source.id)));
+				ON CONFLICT(country, proxy_ip) DO UPDATE SET enabled = 1, source_id = ?4,
+					health_status = CASE WHEN ?5 = 1 THEN 'unknown' ELSE health_status END,
+					consecutive_failures = CASE WHEN ?5 = 1 THEN 0 ELSE consecutive_failures END,
+					cooldown_until = CASE WHEN ?5 = 1 THEN NULL ELSE cooldown_until END,
+					last_error = CASE WHEN ?5 = 1 THEN '' ELSE last_error END,
+					updated_at = ?3`)
+				.bind(entry.country, entry.proxy_ip, now, source.id, 重置健康状态 ? 1 : 0)));
 		}
 		const 删除过期语句 = targetCountry
 			? env.DB.prepare('DELETE FROM proxy_ip_pool WHERE source_id = ?1 AND country = ?2 AND updated_at <> ?3').bind(source.id, targetCountry, now)
@@ -1521,7 +1532,7 @@ async function 同步到期访问PROXYIP数据源(env, { force = false, country 
 		return force || !lastSyncedAt || now - Number(lastSyncedAt) >= Math.max(5, Number(source.refresh_minutes || 30)) * 60000;
 	});
 	const summaries = [];
-	for (const source of sources) summaries.push(await 同步单个访问PROXYIP数据源(env, source, country));
+	for (const source of sources) summaries.push(await 同步单个访问PROXYIP数据源(env, source, country, force));
 	return summaries;
 }
 
@@ -1733,7 +1744,7 @@ async function 执行访问链接操作({ session, env, request, adminSession, i
 		if (!Number.isInteger(hours) || hours < 1 || hours > 8760) throw new Error('续期时长必须是 1 到 8760 小时');
 		if (Number(before.duration_seconds) === 0 && before.expires_at == null) throw new Error('永久链接无需续期');
 		const seconds = hours * 3600;
-		const renewedExpiry = 计算续期到期时间(before.expires_at, now, hours);
+		const renewedExpiry = 计算访问链接续期到期时间(before, now, hours);
 		result = await session.prepare(`UPDATE access_links SET status = 'active', duration_seconds = duration_seconds + ?1,
 			expires_at = ?2 WHERE id = ?3`).bind(seconds, renewedExpiry, id).run();
 	} else if (action === 'reset') {
@@ -1796,6 +1807,10 @@ function 模拟访问链接激活(record, now, clientIP) {
 
 function 计算续期到期时间(expiresAt, now, hours) {
 	return Math.max(Number(expiresAt || now), now) + Number(hours) * 3600000;
+}
+
+function 计算访问链接续期到期时间(record, now, hours) {
+	return record?.first_used_at == null ? null : 计算续期到期时间(record.expires_at, now, hours);
 }
 
 function 获取访问恢复错误(record, now = Date.now()) {
@@ -2067,6 +2082,15 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 					SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
 					FROM proxy_ip_pool WHERE country = ?1`).bind(country).first();
 			}
+			if (!Number(poolState?.healthy) && !Number(poolState?.unknown)) {
+				// 旧版本或短暂故障可能留下整国冷却状态；手动生成时强制同步并清除旧冷却，再做一次小批量检测。
+				await 同步到期访问PROXYIP数据源(env, { force: true, country });
+				await 检测访问PROXYIP池(env, country, 8);
+				poolState = await session.prepare(`SELECT
+					SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
+					SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
+					FROM proxy_ip_pool WHERE country = ?1`).bind(country).first();
+			}
 			if (!Number(poolState?.healthy) && !Number(poolState?.unknown)) throw new Error(`${country} 暂无可用 PROXYIP，请同步数据源或稍后重试`);
 			const durationSeconds = isPermanent ? 0 : durationHours * 3600;
 			const createdAt = Date.now();
@@ -2216,8 +2240,8 @@ function 访问链接增强管理页面() {
 	const html = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>限时访问链接</title><style>
-:root{color-scheme:dark;--bg:#07101d;--panel:#111c2e;--panel2:#0c1728;--line:#2b3b59;--text:#edf3ff;--muted:#99a7bd;--blue:#568eff;--red:#ff627b;--green:#3cda91;--amber:#f3c765}*{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#07101d,#0d1830) fixed;color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1500px;margin:auto;padding:24px}.top,.toolbar,.stats,.actions,.pagination{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.top{justify-content:space-between}.top h1{margin:0;font-size:26px}.top a{color:#a8c5ff}.stats{margin:18px 0;display:grid;grid-template-columns:repeat(5,minmax(150px,1fr))}.stat,.card{background:rgba(17,28,46,.96);border:1px solid var(--line);border-radius:14px;box-shadow:0 14px 40px #0003}.stat{padding:14px}.stat b{display:block;font-size:22px}.stat span,.muted{color:var(--muted)}.card{padding:18px;margin:16px 0}h2,h3{margin:0 0 13px}h2{font-size:18px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.form-grid,.filters{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px}.filters{grid-template-columns:2fr repeat(4,1fr);margin-bottom:12px}label{display:block;color:var(--muted);margin:3px 0}input,textarea,select,button{font:inherit}input,textarea,select{width:100%;color:var(--text);background:#091425;border:1px solid #405273;border-radius:8px;padding:9px}input:focus,textarea:focus,select:focus,button:focus-visible,summary:focus-visible{outline:3px solid #568eff66;outline-offset:2px}textarea{min-height:82px;resize:vertical}button{border:0;border-radius:8px;padding:8px 11px;color:#fff;background:var(--blue);cursor:pointer}button.alt{background:#374865}button.danger{background:#963548}button.ghost{background:transparent;border:1px solid var(--line)}button.small{font-size:12px;padding:5px 8px}button:disabled{opacity:.55;cursor:not-allowed}.notice{padding:10px 12px;border-radius:9px;background:#0b2931;border:1px solid #1c5969;color:#9ee1ee;margin-bottom:12px}.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:10px}table{width:100%;border-collapse:collapse;min-width:1080px}th,td{text-align:left;vertical-align:top;padding:9px 10px;border-bottom:1px solid #23324c}th{position:sticky;top:0;background:#142138;color:#b7c2d4}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.healthy,.active{color:var(--green)}.unhealthy,.expired,.revoked{color:var(--red)}.unused,.unknown,.warning{color:var(--amber)}.tag{display:inline-block;padding:2px 7px;margin:2px;border:1px solid #415779;border-radius:999px;color:#bed0ec}.row-details{margin-top:7px}.row-details>summary,.menu>summary{cursor:pointer;color:#a9c6ff}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 12px;background:var(--panel2);padding:9px;border-radius:8px;margin-top:6px}.menu{position:relative;display:inline-block}.menu-body{position:absolute;right:0;z-index:5;min-width:150px;padding:7px;background:#17243a;border:1px solid var(--line);border-radius:9px;box-shadow:0 12px 30px #0008}.menu-body button{width:100%;margin:2px 0;text-align:left}.cards{display:none}.link-card{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:12px;margin:9px 0}.link-card-head{display:flex;justify-content:space-between;gap:10px}.toast-area{position:fixed;right:18px;bottom:18px;z-index:20;display:grid;gap:8px}.toast{max-width:min(420px,90vw);background:#182842;border:1px solid #45618d;border-radius:10px;padding:11px 14px;box-shadow:0 12px 35px #0008}.toast.error{border-color:#a84357}.toast.partial{border-color:#98762e}.empty,.errorbox{text-align:center;padding:25px;color:var(--muted)}dialog{color:var(--text);background:#111c2e;border:1px solid var(--line);border-radius:14px;width:min(92vw,520px);padding:20px}dialog::backdrop{background:#0009}dialog h3{font-size:18px}.dialog-fields{display:grid;gap:8px}.audit-json{max-width:320px;white-space:pre-wrap;word-break:break-word;font-size:11px}.pool-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}.pool-card{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:11px}.loading{opacity:.7;pointer-events:none}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
-@media(max-width:1000px){.stats{grid-template-columns:repeat(2,1fr)}.form-grid,.filters{grid-template-columns:repeat(2,1fr)}}@media(max-width:720px){.wrap{padding:13px}.grid{grid-template-columns:1fr}.stats{grid-template-columns:1fr 1fr}.filters,.form-grid{grid-template-columns:1fr}.desktop-links{display:none}.cards{display:block}.toolbar{align-items:stretch}.toolbar>*{flex:1 1 140px}.pagination{width:100%}.menu-body{position:fixed;left:14px;right:14px;bottom:14px}.detail-grid{grid-template-columns:1fr}}@media(max-width:420px){.stats{grid-template-columns:1fr}.top h1{font-size:22px}}
+:root{color-scheme:dark;--bg:#07101d;--panel:#111c2e;--panel2:#0c1728;--line:#2b3b59;--text:#edf3ff;--muted:#99a7bd;--blue:#568eff;--red:#ff627b;--green:#3cda91;--amber:#f3c765}*{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#07101d,#0d1830) fixed;color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1500px;margin:auto;padding:24px}.top,.toolbar,.stats,.actions,.pagination{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.top{justify-content:space-between}.top h1{margin:0;font-size:26px}.top a{color:#a8c5ff}.stats{margin:18px 0;display:grid;grid-template-columns:repeat(5,minmax(150px,1fr))}.stat,.card{background:rgba(17,28,46,.96);border:1px solid var(--line);border-radius:14px;box-shadow:0 14px 40px #0003}.stat{padding:14px}.stat b{display:block;font-size:22px}.stat span,.muted{color:var(--muted)}.card{padding:18px;margin:16px 0}h2,h3{margin:0 0 13px}h2{font-size:18px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.form-grid,.filters{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px}.filters{grid-template-columns:2fr repeat(4,1fr);margin-bottom:12px}label{display:block;color:var(--muted);margin:3px 0}input,textarea,select,button{font:inherit}input,textarea,select{width:100%;color:var(--text);background:#091425;border:1px solid #405273;border-radius:8px;padding:9px}input:focus,textarea:focus,select:focus,button:focus-visible,summary:focus-visible{outline:3px solid #568eff66;outline-offset:2px}textarea{min-height:82px;resize:vertical}button{border:0;border-radius:8px;padding:8px 11px;color:#fff;background:var(--blue);cursor:pointer}button.alt{background:#374865}button.danger{background:#963548}button.ghost{background:transparent;border:1px solid var(--line)}button.small{font-size:12px;padding:5px 8px}button:disabled{opacity:.55;cursor:not-allowed}.notice{padding:10px 12px;border-radius:9px;background:#0b2931;border:1px solid #1c5969;color:#9ee1ee;margin-bottom:12px}.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:10px}table{width:100%;border-collapse:collapse;min-width:1080px}th,td{text-align:left;vertical-align:top;padding:9px 10px;border-bottom:1px solid #23324c}th{position:sticky;top:0;background:#142138;color:#b7c2d4}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.healthy,.active{color:var(--green)}.unhealthy,.expired,.revoked{color:var(--red)}.unused,.unknown,.warning{color:var(--amber)}.tag{display:inline-block;padding:2px 7px;margin:2px;border:1px solid #415779;border-radius:999px;color:#bed0ec}.row-details{margin-top:7px}.row-details>summary,.menu>summary{cursor:pointer;color:#a9c6ff}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 12px;background:var(--panel2);padding:9px;border-radius:8px;margin-top:6px}.menu{position:relative;display:inline-block}.menu-body{position:fixed;left:0;top:0;right:auto;z-index:30;visibility:hidden;min-width:170px;max-height:calc(100vh - 16px);overflow-y:auto;padding:7px;background:#17243a;border:1px solid var(--line);border-radius:9px;box-shadow:0 12px 30px #0008}.menu-body button{width:100%;margin:2px 0;text-align:left}.cards{display:none}.link-card{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:12px;margin:9px 0}.link-card-head{display:flex;justify-content:space-between;gap:10px}.toast-area{position:fixed;right:18px;bottom:18px;z-index:20;display:grid;gap:8px}.toast{max-width:min(420px,90vw);background:#182842;border:1px solid #45618d;border-radius:10px;padding:11px 14px;box-shadow:0 12px 35px #0008}.toast.error{border-color:#a84357}.toast.partial{border-color:#98762e}.empty,.errorbox{text-align:center;padding:25px;color:var(--muted)}dialog{color:var(--text);background:#111c2e;border:1px solid var(--line);border-radius:14px;width:min(92vw,520px);padding:20px}dialog::backdrop{background:#0009}dialog h3{font-size:18px}.dialog-fields{display:grid;gap:8px}.audit-json{max-width:320px;white-space:pre-wrap;word-break:break-word;font-size:11px}.pool-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}.pool-card{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:11px}.loading{opacity:.7;pointer-events:none}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+@media(max-width:1000px){.stats{grid-template-columns:repeat(2,1fr)}.form-grid,.filters{grid-template-columns:repeat(2,1fr)}}@media(max-width:720px){.wrap{padding:13px}.grid{grid-template-columns:1fr}.stats{grid-template-columns:1fr 1fr}.filters,.form-grid{grid-template-columns:1fr}.desktop-links{display:none}.cards{display:block}.toolbar{align-items:stretch}.toolbar>*{flex:1 1 140px}.pagination{width:100%}.menu-body{left:14px!important;right:14px!important;top:auto!important;bottom:14px;visibility:visible!important;max-height:70vh}.detail-grid{grid-template-columns:1fr}}@media(max-width:420px){.stats{grid-template-columns:1fr}.top h1{font-size:22px}}
 </style></head><body><main class="wrap">
 <header class="top"><div><h1>限时访问链接</h1><div class="muted">真实连接时开始计时；限制、健康状态和会话均由 D1 原子维护</div></div><div class="actions"><a href="/admin">返回原后台</a><button class="ghost" id="logoutAll">退出所有设备</button></div></header>
 <section class="stats" id="stats" aria-label="运行概况"></section>
@@ -2238,7 +2262,7 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const fmt=v=>v?new Date(Number(v)).toLocaleString():'—';
 const csrf=()=>decodeURIComponent((document.cookie.split('; ').find(x=>x.startsWith('admin_csrf='))||'=').split('=').slice(1).join('='));
 function toast(message,type){const n=document.createElement('div');n.className='toast '+(type||'');n.textContent=message;$('#toasts').append(n);setTimeout(()=>n.remove(),5000)}
-async function api(path,options){options=options||{};const headers=new Headers(options.headers||{});if(options.method&&options.method!=='GET'){headers.set('Content-Type','application/json');headers.set('X-CSRF-Token',csrf())}const r=await fetch('/admin/access/api/'+path,{...options,headers});const j=await r.json().catch(()=>({error:'响应格式错误'}));if(!r.ok&&r.status!==207||j.success===false)throw new Error(j.error||'请求失败');return j}
+async function api(path,options){options=options||{};const headers=new Headers(options.headers||{});if(options.method&&options.method!=='GET'){headers.set('Content-Type','application/json');headers.set('X-CSRF-Token',csrf())}const r=await fetch('/admin/access/api/'+path,{...options,headers});const contentType=(r.headers.get('Content-Type')||'').toLowerCase();if(r.redirected||!contentType.includes('application/json')){if(r.redirected&&new URL(r.url).pathname==='/login')location.assign('/login');throw new Error(r.redirected?'管理员会话已失效，请重新登录':'服务器返回了非 JSON 响应')}const j=await r.json().catch(()=>{throw new Error('服务器 JSON 响应无法解析')});if(r.status===401){location.assign('/login');throw new Error(j.error||'管理员会话已失效，请重新登录')}if((!r.ok&&r.status!==207)||j.success===false)throw new Error(j.error||'请求失败');return j}
 async function download(path,filename,confirmation){const r=await fetch('/admin/access/api/'+path,{headers:{'X-Export-Confirmation':confirmation}});if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||'导出失败')}const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=filename;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
 let page=1,pageSize=20,total=0,links=[],selected=new Set(),filters={},auditPage=1,auditTotal=0,auditFilter={};
 const statusNames={unused:'未使用',active:'使用中',expired:'已过期',revoked:'已停用'};
@@ -2247,11 +2271,13 @@ function actionMenu(x){const primary=x.display_status==='expired'?'<button class
 function details(x){const tagHtml=(x.tags_list||[]).map(t=>'<span class="tag">'+esc(t)+'</span>').join('')||'—';return '<details class="row-details"><summary>详情</summary><div class="detail-grid"><span>UUID</span><span class="mono">'+esc(x.uuid)+'</span><span>首次使用</span><span>'+fmt(x.first_used_at)+'</span><span>完整到期</span><span>'+fmt(x.expires_at)+'</span><span>限制</span><span>并发 '+Number(x.max_concurrent_connections||0)+' / 累计 '+Number(x.max_total_connections||0)+'</span><span>绑定</span><span>'+(Number(x.bind_first_ip)?(x.bound_ip?'已绑定':'等待首次 IP'):'未启用')+'</span><span>标签</span><span>'+tagHtml+'</span></div></details>'}
 function renderLinks(){const rows=links.map(x=>'<tr><td><input type="checkbox" data-select="'+x.id+'" '+(selected.has(Number(x.id))?'checked':'')+' aria-label="选择链接 '+x.id+'"></td><td><b>#'+x.id+'</b><br>'+esc(x.note||'—')+details(x)+'</td><td>'+esc(x.country)+'</td><td class="'+esc(x.display_status)+'">'+statusNames[x.display_status]+'</td><td data-countdown="'+(x.expires_at||'')+'">'+remaining(x)+'</td><td>'+fmt(x.last_used_at)+'</td><td>'+Number(x.active_connections||0)+' / '+Number(x.connection_count||0)+'</td><td class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'</td><td>'+actionMenu(x)+'</td></tr>').join('');$('#links').innerHTML=rows||'<tr><td colspan="9" class="empty">没有符合条件的链接</td></tr>';$('#linkCards').innerHTML=links.map(x=>'<article class="link-card"><div class="link-card-head"><label><input type="checkbox" data-select="'+x.id+'" '+(selected.has(Number(x.id))?'checked':'')+'> <b>#'+x.id+' '+esc(x.note||'')+'</b></label><span class="'+x.display_status+'">'+statusNames[x.display_status]+'</span></div><p>'+esc(x.country)+' · <span data-countdown="'+(x.expires_at||'')+'">'+remaining(x)+'</span><br>连接 '+Number(x.active_connections||0)+' / '+Number(x.connection_count||0)+'<br><span class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'</span></p>'+details(x)+'<div class="actions">'+actionMenu(x)+'</div></article>').join('')||'<div class="empty">没有符合条件的链接</div>';updateSelection()}
 function updateSelection(){$$('[data-select]').forEach(b=>b.checked=selected.has(Number(b.dataset.select)));$('#selectedCount').textContent='已选 '+selected.size+' 条';$('#runBulk').disabled=!selected.size||!$('#bulkAction').value;$('#selectAll').checked=links.length>0&&links.every(x=>selected.has(Number(x.id)));$('#selectAll').indeterminate=links.some(x=>selected.has(Number(x.id)))&&!links.every(x=>selected.has(Number(x.id)))}
-async function load(){const card=$('#linksCard');card.classList.add('loading');try{const p=new URLSearchParams({...filters,limit:pageSize,offset:(page-1)*pageSize});const d=await api('state?'+p);links=d.links||[];total=Number(d.pagination.total||0);const pages=Math.max(1,Math.ceil(total/pageSize));if(page>pages){page=pages;return load()}const s=d.stats||{};$('#stats').innerHTML=[['当前连接',s.current_connections||0],['24 小时连接',(s.connections_24h||0)+' / 失败 '+(s.failure_rate_24h||0)+'%'],['健康 IP',(s.healthy_ip_ratio||0)+'%'],['低容量国家',s.low_capacity_countries||0],['链接总数',s.total||0]].map(v=>'<div class="stat"><b>'+v[1]+'</b><span>'+v[0]+'</span></div>').join('');$('#notifyState').textContent=d.security&&d.security.notifications_configured?'Webhook / Telegram 通知已配置':'通知未配置，不影响链接与健康检查';selected=new Set(Array.from(selected).filter(id=>links.some(x=>Number(x.id)===id)));renderLinks();$('#pageInfo').textContent='第 '+page+' / '+pages+' 页 · '+total+' 条';$$('[data-page="prev"]').forEach(b=>b.disabled=page<=1);$$('[data-page="next"]').forEach(b=>b.disabled=page>=pages);renderPools(d);await loadAudit()}catch(e){toast(e.message,'error');$('#links').innerHTML='<tr><td colspan="9" class="errorbox">加载失败：'+esc(e.message)+'</td></tr>'}finally{card.classList.remove('loading')}}
+function closeMenus(except){$$('.menu[open]').forEach(menu=>{if(menu!==except)menu.removeAttribute('open')})}
+function positionMenu(menu){const trigger=menu.querySelector('summary'),panel=menu.querySelector('.menu-body');if(!menu.open||!trigger||!panel)return;panel.style.visibility='hidden';panel.style.left='0px';panel.style.top='0px';requestAnimationFrame(()=>{if(!menu.open)return;const rect=trigger.getBoundingClientRect(),gap=8,width=panel.offsetWidth,height=panel.offsetHeight;const left=Math.max(gap,Math.min(rect.right-width,window.innerWidth-width-gap));const below=rect.bottom+6;const top=below+height<=window.innerHeight-gap?below:Math.max(gap,rect.top-height-6);panel.style.left=left+'px';panel.style.top=top+'px';panel.style.visibility='visible'})}
+async function load(){const card=$('#linksCard');card.classList.add('loading');try{const p=new URLSearchParams({...filters,limit:pageSize,offset:(page-1)*pageSize});const d=await api('state?'+p);links=d.links||[];total=Number(d.pagination.total||0);const pages=Math.max(1,Math.ceil(total/pageSize));if(page>pages){page=pages;return load()}const s=d.stats||{};$('#stats').innerHTML=[['当前连接',s.current_connections||0],['24 小时连接',(s.connections_24h||0)+' / 失败 '+(s.failure_rate_24h||0)+'%'],['健康 IP',(s.healthy_ip_ratio||0)+'%'],['低容量国家',s.low_capacity_countries||0],['链接总数',s.total||0]].map(v=>'<div class="stat"><b>'+v[1]+'</b><span>'+v[0]+'</span></div>').join('');$('#notifyState').textContent=d.security&&d.security.notifications_configured?'Webhook / Telegram 通知已配置':'通知未配置，不影响链接与健康检查';selected=new Set(Array.from(selected).filter(id=>links.some(x=>Number(x.id)===id)));renderLinks();$('#pageInfo').textContent='第 '+page+' / '+pages+' 页 · '+total+' 条';$$('[data-page="prev"]').forEach(b=>b.disabled=page<=1);$$('[data-page="next"]').forEach(b=>b.disabled=page>=pages);renderPools(d);await loadAudit()}catch(e){const message=e&&e.message?e.message:'未知错误';toast(message,'error');$('#notifyState').textContent='通知配置读取失败：'+message;$('#notifyState').classList.add('errorbox');$('#links').innerHTML='<tr><td colspan="9" class="errorbox">加载失败：'+esc(message)+'</td></tr>'}finally{card.classList.remove('loading')}}
 function renderPools(d){$('#poolStats').innerHTML=(d.poolStats||[]).map(x=>'<article class="pool-card"><b>'+esc(x.country)+'</b><div>健康 '+Number(x.healthy||0)+' / '+Number(x.total||0)+' · 隔离 '+Number(x.isolated||0)+'</div><div>分配 '+Number(x.assigned||0)+' · 延迟 '+(x.average_latency_ms==null?'—':x.average_latency_ms+' ms')+'</div><div class="'+(Number(x.healthy)<Number(x.min_healthy_ips)?'warning':'healthy')+'">阈值 '+Number(x.min_healthy_ips)+' · 评分 '+Number(x.average_health_score||0)+'</div><div class="actions"><button class="small" data-sync-country="'+esc(x.country)+'">同步</button><button class="small alt" data-check-country="'+esc(x.country)+'">检测</button><button class="small alt" data-threshold-country="'+esc(x.country)+'" data-threshold="'+Number(x.min_healthy_ips)+'">阈值</button></div></article>').join('')||'<div class="empty">还没有国家 IP 池</div>';$('#pools').innerHTML=(d.pools||[]).map(x=>'<tr><td>'+esc(x.country)+'</td><td class="mono">'+esc(x.proxy_ip)+'</td><td class="'+esc(x.health_status||'unknown')+'">'+esc(x.health_status||'unknown')+(x.cooldown_until&&Number(x.cooldown_until)>Date.now()?'（隔离）':'')+'</td><td>'+Number(x.health_score||0)+'</td><td>'+(x.latency_ms==null?'—':Number(x.latency_ms)+' ms')+'</td><td>'+Number(x.real_success_count||0)+' / '+Number(x.real_failure_count||0)+'</td><td>'+fmt(x.last_checked_at)+'</td></tr>').join('');$('#sources').innerHTML=(d.sources||[]).map(x=>'<tr><td>'+esc(x.name)+'</td><td class="mono">'+esc(String(x.url).slice(0,90))+'</td><td class="'+(x.last_status==='error'?'unhealthy':x.last_status==='success'?'healthy':'unknown')+'">'+esc(x.last_status)+(x.last_error?'<br>'+esc(x.last_error):'')+'</td><td>'+Number(x.consecutive_failures||0)+'</td><td><button class="small alt" data-source-id="'+x.id+'" data-source-action="'+(x.enabled?'disable':'enable')+'">'+(x.enabled?'停用':'启用')+'</button>'+(String(x.url).includes('zip.cm.edu.kg')?'':'<button class="small danger" data-source-id="'+x.id+'" data-source-action="delete">删除</button>')+'</td></tr>').join('')}
-async function loadAudit(){const p=new URLSearchParams({...auditFilter,limit:20,offset:(auditPage-1)*20}),d=await api('audit?'+p);auditTotal=Number(d.pagination.total||0);$('#audit').innerHTML=(d.logs||[]).map(x=>'<tr><td>'+fmt(x.created_at)+'</td><td>'+esc(x.action)+'</td><td>'+esc(x.object_type)+' #'+esc(x.object_id)+'</td><td>'+esc(x.source_ip||'未记录')+(x.source_asn?' / AS'+esc(x.source_asn):'')+'</td><td class="'+(x.success?'healthy':'unhealthy')+'">'+(x.success?'成功':'失败：'+esc(x.error_message))+'</td><td><details><summary>查看</summary><pre class="audit-json">'+esc(x.before_summary||'')+'\n→\n'+esc(x.after_summary||'')+'</pre></details></td></tr>').join('')||'<tr><td colspan="6" class="empty">暂无审计记录</td></tr>';$('#auditPage').textContent='第 '+auditPage+' / '+Math.max(1,Math.ceil(auditTotal/20))+' 页'}
+async function loadAudit(){const p=new URLSearchParams({...auditFilter,limit:20,offset:(auditPage-1)*20}),d=await api('audit?'+p);auditTotal=Number(d.pagination.total||0);$('#audit').innerHTML=(d.logs||[]).map(x=>'<tr><td>'+fmt(x.created_at)+'</td><td>'+esc(x.action)+'</td><td>'+esc(x.object_type)+' #'+esc(x.object_id)+'</td><td>'+esc(x.source_ip||'未记录')+(x.source_asn?' / AS'+esc(x.source_asn):'')+'</td><td class="'+(x.success?'healthy':'unhealthy')+'">'+(x.success?'成功':'失败：'+esc(x.error_message))+'</td><td><details><summary>查看</summary><pre class="audit-json">'+esc(x.before_summary||'')+'\\n→\\n'+esc(x.after_summary||'')+'</pre></details></td></tr>').join('')||'<tr><td colspan="6" class="empty">暂无审计记录</td></tr>';$('#auditPage').textContent='第 '+auditPage+' / '+Math.max(1,Math.ceil(auditTotal/20))+' 页'}
 function confirmDialog(title,message,fields){return new Promise(resolve=>{const d=$('#actionDialog'),f=$('#actionForm'),box=$('#dialogFields');$('#dialogTitle').textContent=title;$('#dialogMessage').textContent=message;box.innerHTML=fields||'';d.showModal();f.onsubmit=e=>{e.preventDefault();const value=e.submitter&&e.submitter.value;if(value!=='confirm'){d.close();resolve(null);return}const data=Object.fromEntries(new FormData(f));d.close();resolve(data)}})}
-function actionSpec(action,x,count){const n=count||1,m={revoke:['停用链接','将禁止新连接；本实例连接立即关闭，其他实例最长约 30 秒发现并断开。',''],restore:['恢复链接','仅恢复已停用且尚未过期的链接；已过期链接请续期。',''],renew:['续期','从当前到期时间或当前时间（较晚者）起增加时长，并恢复为可用。','<label>增加小时数<input name="hours" type="number" min="1" max="8760" value="24" required></label>'],reset:['重置计时','清除首次使用、到期、已分配 IP、绑定和全部使用统计；下一次真实连接重新计时。',''],reassign:['重选 IP','只更换 PROXYIP，不重置计时、绑定或使用统计。',''],rotate:['轮换凭据','旧凭据立即不能建立新连接；国家、IP、计时和统计保持不变。','<label>轮换范围<select name="mode"><option value="both">Token 和 UUID</option><option value="token">仅 Token</option><option value="uuid">仅 UUID</option></select></label>'],delete:['删除链接','永久删除 '+n+' 条链接及其连接事件，无法撤销。',''],tags:['修改标签','为 '+n+' 条链接设置相同标签。','<label>标签（逗号分隔）<input name="tags" maxlength="300"></label>']};if(action==='edit')return ['编辑链接','修改备注、标签、连接限制和首次 IP 绑定。','<label>备注<input name="note" maxlength="200" value="'+esc(x.note||'')+'"></label><label>标签<input name="tags" value="'+esc((x.tags_list||[]).join(','))+'"></label><label>并发上限<input name="maxConcurrentConnections" type="number" min="0" max="10000" value="'+Number(x.max_concurrent_connections||0)+'"></label><label>累计上限<input name="maxTotalConnections" type="number" min="0" max="10000000" value="'+Number(x.max_total_connections||0)+'"></label><label>首次 IP 绑定<select name="bindFirstIp"><option value="0" '+(!Number(x.bind_first_ip)?'selected':'')+'>关闭</option><option value="1" '+(Number(x.bind_first_ip)?'selected':'')+'>开启</option></select></label>'];return m[action]}
+function actionSpec(action,x,count){const n=count||1,m={revoke:['停用链接','将禁止新连接；本实例连接立即关闭，其他实例最长约 30 秒发现并断开。',''],restore:['恢复链接','仅恢复已停用且尚未过期的链接；已过期链接请续期。',''],renew:['续期','未使用链接只增加总时长，仍从首次连接开始计时；已使用链接从当前到期时间或当前时间（较晚者）起增加。','<label>增加小时数<input name="hours" type="number" min="1" max="8760" value="24" required></label>'],reset:['重置计时','清除首次使用、到期、已分配 IP、绑定和全部使用统计；下一次真实连接重新计时。',''],reassign:['重选 IP','只更换 PROXYIP，不重置计时、绑定或使用统计。',''],rotate:['轮换凭据','旧凭据立即不能建立新连接；国家、IP、计时和统计保持不变。','<label>轮换范围<select name="mode"><option value="both">Token 和 UUID</option><option value="token">仅 Token</option><option value="uuid">仅 UUID</option></select></label>'],delete:['删除链接','永久删除 '+n+' 条链接及其连接事件，无法撤销。',''],tags:['修改标签','为 '+n+' 条链接设置相同标签。','<label>标签（逗号分隔）<input name="tags" maxlength="300"></label>']};if(action==='edit')return ['编辑链接','修改备注、标签、连接限制和首次 IP 绑定。','<label>备注<input name="note" maxlength="200" value="'+esc(x.note||'')+'"></label><label>标签<input name="tags" value="'+esc((x.tags_list||[]).join(','))+'"></label><label>并发上限<input name="maxConcurrentConnections" type="number" min="0" max="10000" value="'+Number(x.max_concurrent_connections||0)+'"></label><label>累计上限<input name="maxTotalConnections" type="number" min="0" max="10000000" value="'+Number(x.max_total_connections||0)+'"></label><label>首次 IP 绑定<select name="bindFirstIp"><option value="0" '+(!Number(x.bind_first_ip)?'selected':'')+'>关闭</option><option value="1" '+(Number(x.bind_first_ip)?'selected':'')+'>开启</option></select></label>'];return m[action]}
 async function runAction(action,ids,x){const spec=actionSpec(action,x,ids.length);if(!spec)return;const extra=await confirmDialog(spec[0],spec[1],spec[2]);if(!extra)return;const payload={action,...extra};if(ids.length===1)payload.id=ids[0];else payload.ids=ids;$('#linksCard').classList.add('loading');try{const d=await api('links/action',{method:'POST',body:JSON.stringify(payload)});toast(d.message,d.partial?'partial':'');selected.clear();await load()}finally{$('#linksCard').classList.remove('loading')}}
 $('#filters').addEventListener('submit',e=>{e.preventDefault();filters=Object.fromEntries(new FormData(e.target));page=1;selected.clear();load()});
 $('#createForm').addEventListener('submit',async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const d=await api('links',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});toast(d.message);page=1;await load()}catch(x){toast(x.message,'error')}finally{b.disabled=false}});
@@ -2267,7 +2293,10 @@ $('#backupExport').addEventListener('click',async()=>{const ok=await confirmDial
 $('#backupFile').addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;try{const data=JSON.parse(await file.text());let mode='merge',confirmOverwrite='';const first=await confirmDialog('恢复 D1 备份','默认不覆盖现有数据。勾选后将覆盖相同主键记录。','<label><select name="mode"><option value="merge">仅合并，不覆盖</option><option value="overwrite">覆盖相同记录</option></select></label>');if(!first)return;mode=first.mode;if(mode==='overwrite'){const second=await confirmDialog('二次确认覆盖','输入 RESTORE OVERWRITE 才会执行覆盖恢复。','<label>确认文本<input name="confirmOverwrite" required></label>');if(!second)return;confirmOverwrite=second.confirmOverwrite}const d=await api('backup/restore',{method:'POST',body:JSON.stringify({...data,mode,confirmOverwrite})});toast(d.message,d.partial?'partial':'');await load()}catch(x){toast(x.message,'error')}finally{e.target.value=''}});
 $$('[data-audit-export]').forEach(b=>b.addEventListener('click',()=>download('audit/export?format='+b.dataset.auditExport,'edgetunnel-audit.'+b.dataset.auditExport,'')));
 document.addEventListener('change',e=>{if(e.target.matches('[data-select]')){const id=Number(e.target.dataset.select);e.target.checked?selected.add(id):selected.delete(id);updateSelection()}});
-document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;b.disabled=true;try{if(b.dataset.copy){await navigator.clipboard.writeText(b.dataset.copy);toast('已复制到剪贴板')}else if(b.dataset.action){const x=links.find(v=>Number(v.id)===Number(b.dataset.id));await runAction(b.dataset.action,[Number(b.dataset.id)],x)}else if(b.dataset.page){page+=b.dataset.page==='next'?1:-1;selected.clear();await load()}else if(b.dataset.auditPage){auditPage=Math.max(1,auditPage+(b.dataset.auditPage==='next'?1:-1));await loadAudit()}else if(b.dataset.syncCountry){const d=await api('pools/sync',{method:'POST',body:JSON.stringify({country:b.dataset.syncCountry})});toast(d.message);await load()}else if(b.dataset.checkCountry){const d=await api('pools/check',{method:'POST',body:JSON.stringify({country:b.dataset.checkCountry,limit:8})});toast(d.message);await load()}else if(b.dataset.thresholdCountry){const v=await confirmDialog('健康 IP 阈值',b.dataset.thresholdCountry+' 低于此数量时触发警告和通知。','<label>最低健康 IP<input name="minimum" type="number" min="1" max="100" value="'+b.dataset.threshold+'" required></label>');if(v){const d=await api('health/threshold',{method:'POST',body:JSON.stringify({country:b.dataset.thresholdCountry,minimum:v.minimum})});toast(d.message);await load()}}else if(b.dataset.sourceAction){if(b.dataset.sourceAction==='delete'&&!await confirmDialog('删除数据源','将同时删除该来源导入的 IP。',''))return;const d=await api('sources/action',{method:'POST',body:JSON.stringify({id:Number(b.dataset.sourceId),action:b.dataset.sourceAction})});toast(d.message);await load()}}catch(x){toast(x.message,'error')}finally{b.disabled=false}});
+document.addEventListener('toggle',e=>{const menu=e.target.closest?.('.menu');if(!menu||e.target!==menu)return;if(menu.open){closeMenus(menu);positionMenu(menu)}},true);
+document.addEventListener('click',e=>{if(!e.target.closest('.menu'))closeMenus()});
+addEventListener('scroll',()=>closeMenus(),true);addEventListener('resize',()=>closeMenus());
+document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;const menu=b.closest('.menu');if(menu)menu.removeAttribute('open');b.disabled=true;try{if(b.dataset.copy){await navigator.clipboard.writeText(b.dataset.copy);toast('已复制到剪贴板')}else if(b.dataset.action){const x=links.find(v=>Number(v.id)===Number(b.dataset.id));await runAction(b.dataset.action,[Number(b.dataset.id)],x)}else if(b.dataset.page){page+=b.dataset.page==='next'?1:-1;selected.clear();await load()}else if(b.dataset.auditPage){auditPage=Math.max(1,auditPage+(b.dataset.auditPage==='next'?1:-1));await loadAudit()}else if(b.dataset.syncCountry){const d=await api('pools/sync',{method:'POST',body:JSON.stringify({country:b.dataset.syncCountry})});toast(d.message);await load()}else if(b.dataset.checkCountry){const d=await api('pools/check',{method:'POST',body:JSON.stringify({country:b.dataset.checkCountry,limit:8})});toast(d.message);await load()}else if(b.dataset.thresholdCountry){const v=await confirmDialog('健康 IP 阈值',b.dataset.thresholdCountry+' 低于此数量时触发警告和通知。','<label>最低健康 IP<input name="minimum" type="number" min="1" max="100" value="'+b.dataset.threshold+'" required></label>');if(v){const d=await api('health/threshold',{method:'POST',body:JSON.stringify({country:b.dataset.thresholdCountry,minimum:v.minimum})});toast(d.message);await load()}}else if(b.dataset.sourceAction){if(b.dataset.sourceAction==='delete'&&!await confirmDialog('删除数据源','将同时删除该来源导入的 IP。',''))return;const d=await api('sources/action',{method:'POST',body:JSON.stringify({id:Number(b.dataset.sourceId),action:b.dataset.sourceAction})});toast(d.message);await load()}}catch(x){toast(x.message,'error')}finally{b.disabled=false}});
 setInterval(()=>$$('[data-countdown]').forEach(n=>{const x=links.find(v=>String(v.expires_at||'')===n.dataset.countdown);if(x)n.textContent=remaining(x)}),1000);load();
 </script></body></html>`;
 	return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" } });
@@ -2314,7 +2343,7 @@ document.addEventListener('click',async e=>{const b=e.target.closest('button');i
 }
 
 ///////////////////////////////////////////////////////////////////////XHTTP传输数据///////////////////////////////////////////////
-async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null) {
+async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null, 请求反代上下文 = null) {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
 	const reader = request.body.getReader();
 	const 首包 = await 读取XHTTP首包(reader, yourUUID);
@@ -2368,6 +2397,12 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 	};
 
 	let XHTTP上行写入队列 = null;
+	let XHTTP访问到期定时器 = null;
+	const 结束XHTTP访问授权 = (success, errorCode) => {
+		if (XHTTP访问到期定时器) clearTimeout(XHTTP访问到期定时器);
+		XHTTP访问到期定时器 = null;
+		return 结束访问授权上下文(访问授权上下文, success, errorCode);
+	};
 	return new Response(new ReadableStream({
 		async start(controller) {
 			let 已关闭 = false;
@@ -2389,6 +2424,7 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 					} catch (e) {
 						已关闭 = true;
 						this.readyState = WebSocket.CLOSED;
+						void 结束XHTTP访问授权(访问授权上下文?.代理连接成功, 'client_cancelled');
 					}
 				},
 				close() {
@@ -2396,9 +2432,10 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 					已关闭 = true;
 					this.readyState = WebSocket.CLOSED;
 					try { controller.close() } catch (e) { }
+					void 结束XHTTP访问授权(访问授权上下文?.代理连接成功, 访问授权上下文?.代理连接成功 ? '' : 'upstream_failed');
 				}
 			};
-			const 访问到期定时器 = 安排访问链接到期(访问授权上下文, () => {
+			XHTTP访问到期定时器 = 安排访问链接到期(访问授权上下文, () => {
 				try { remoteConnWrapper.socket?.close() } catch (e) { }
 				closeSocketQuietly(xhttpBridge);
 			});
@@ -2429,7 +2466,7 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 						udpRespHeader = null;
 					}
 				} else {
-					await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, xhttpBridge, 首包.respHeader, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
+					await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, xhttpBridge, 首包.respHeader, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文 || 请求反代上下文);
 				}
 
 				while (true) {
@@ -2456,11 +2493,9 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 				log(`[XHTTP转发] 处理失败: ${err?.message || err}`);
 				closeSocketQuietly(xhttpBridge);
 			} finally {
-				if (访问到期定时器) clearTimeout(访问到期定时器);
 				上行写入队列.清空();
 				释放远端写入器();
 				try { reader.releaseLock() } catch (e) { }
-				await 结束访问授权上下文(访问授权上下文, 访问授权上下文?.代理连接成功, 访问授权上下文?.代理连接成功 ? '' : 'upstream_failed');
 			}
 		},
 		cancel() {
@@ -2468,7 +2503,7 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			释放远端写入器();
 			try { reader.releaseLock() } catch (e) { }
-			结束访问授权上下文(访问授权上下文, 访问授权上下文?.代理连接成功, 'client_cancelled');
+			结束XHTTP访问授权(访问授权上下文?.代理连接成功, 'client_cancelled');
 		}
 	}), { status: 200, headers: responseHeaders });
 }
@@ -2639,7 +2674,7 @@ async function 读取XHTTP首包(reader, token) {
 	return null;
 }
 ///////////////////////////////////////////////////////////////////////gRPC传输数据///////////////////////////////////////////////
-async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null) {
+async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null, 请求反代上下文 = null) {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
 	const reader = request.body.getReader();
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
@@ -2848,7 +2883,7 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null)
 									isDnsQuery = true;
 									if (有效数据长度(rawClientData) > 0) await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request, 访问授权上下文);
 								} else {
-									await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
+									await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文 || 请求反代上下文);
 								}
 							} else {
 								判断是否是木马 = false;
@@ -2872,7 +2907,7 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null)
 									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request, 访问授权上下文);
 									else await forwardataudp(rawData, grpcBridge, null, request, null, 访问授权上下文);
 								}
-								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
+								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文 || 请求反代上下文);
 							}
 						}
 					}
@@ -2939,7 +2974,7 @@ function 解码WS早期数据(header, token) {
 }
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = null) {
+async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = null, 请求反代上下文 = null) {
 	const WS套接字对 = new WebSocketPair();
 	const [clientSock, serverSock] = Object.values(WS套接字对);
 	try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
@@ -3191,7 +3226,7 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 			}
 			if (已写入) continue;
 			if (上下文.首包已建立 && 上下文.目标主机 && 上下文.目标端口 > 0) {
-				await forwardataTCP(上下文.目标主机, 上下文.目标端口, 明文块, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
+				await forwardataTCP(上下文.目标主机, 上下文.目标端口, 明文块, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文 || 请求反代上下文);
 				continue;
 			}
 			const 明文数据 = 数据转Uint8Array(明文块);
@@ -3232,7 +3267,7 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 			上下文.首包已建立 = true;
 			上下文.目标主机 = hostname;
 			上下文.目标端口 = port;
-			await forwardataTCP(hostname, port, rawClientData, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
+			await forwardataTCP(hostname, port, rawClientData, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文 || 请求反代上下文);
 		}
 	};
 
@@ -3278,7 +3313,7 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 				if (有效数据长度(rawClientData) > 0) return 转发木马UDP数据(rawClientData, serverSock, 木马UDP上下文, request, 访问授权上下文);
 				return;
 			}
-			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
+			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文 || 请求反代上下文);
 		} else {
 			判断是否是木马 = false;
 			当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
@@ -3301,7 +3336,7 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request, 访问授权上下文);
 				return forwardataudp(rawData, serverSock, respHeader, request, null, 访问授权上下文);
 			}
-			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文);
+			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文 || 请求反代上下文);
 		}
 	};
 
@@ -3696,13 +3731,19 @@ async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 	return new Uint8Array(pt);
 }
 
+function 获取TCP反代配置(请求反代上下文 = null) {
+	if (请求反代上下文) return 请求反代上下文;
+	return { 反代IP, 启用反代兜底, 启用SOCKS5反代, 启用SOCKS5全局反代, parsedSocks5Address };
+}
+
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null, 请求反代上下文 = null) {
-	const 当前反代IP = 请求反代上下文?.反代IP ?? 反代IP;
-	const 当前启用反代兜底 = 请求反代上下文?.启用反代兜底 ?? 启用反代兜底;
-	const 当前启用SOCKS5反代 = 请求反代上下文?.启用SOCKS5反代 ?? 启用SOCKS5反代;
-	const 当前启用SOCKS5全局反代 = 请求反代上下文?.启用SOCKS5全局反代 ?? 启用SOCKS5全局反代;
-	const 当前parsedSocks5Address = 请求反代上下文?.parsedSocks5Address ?? parsedSocks5Address;
-	const 当前访问授权上下文 = 请求反代上下文?.访问授权上下文 || null;
+	const 当前反代配置 = 获取TCP反代配置(请求反代上下文);
+	const 当前反代IP = 当前反代配置.反代IP;
+	const 当前启用反代兜底 = 当前反代配置.启用反代兜底;
+	const 当前启用SOCKS5反代 = 当前反代配置.启用SOCKS5反代;
+	const 当前启用SOCKS5全局反代 = 当前反代配置.启用SOCKS5全局反代;
+	const 当前parsedSocks5Address = 当前反代配置.parsedSocks5Address || {};
+	const 当前访问授权上下文 = 当前反代配置.访问授权上下文 || null;
 	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${当前反代IP} | 反代兜底: ${当前启用反代兜底 ? '是' : '否'} | 反代类型: ${当前启用SOCKS5反代 || 'proxyip'} | 全局: ${当前启用SOCKS5全局反代 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
 	let 已通过代理发送首包 = false;
@@ -3753,7 +3794,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				if (记录代理健康 && 当前访问授权上下文) await 记录访问代理连接结果(当前访问授权上下文, false, 候选.port === 443 ? 候选.hostname : `${候选.hostname}:${候选.port}`, null, error?.message || error);
 				throw error;
 			}
-		}, 访问授权上下文);
+		});
 		let winner = null;
 		try {
 			winner = await Promise.any(attempts);
@@ -3830,15 +3871,15 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			let newSocket;
 			if (当前启用SOCKS5反代 === 'socks5') {
 				log(`[SOCKS5代理] 代理到: ${host}:${portNum}`);
-				newSocket = await socks5Connect(host, portNum, 本次首包数据, TCP连接);
+				newSocket = await socks5Connect(host, portNum, 本次首包数据, TCP连接, 当前parsedSocks5Address);
 			} else if (当前启用SOCKS5反代 === 'http') {
 				log(`[HTTP代理] 代理到: ${host}:${portNum}`);
-				newSocket = await httpConnect(host, portNum, 本次首包数据, false, TCP连接);
+				newSocket = await httpConnect(host, portNum, 本次首包数据, false, TCP连接, 当前parsedSocks5Address);
 			} else if (当前启用SOCKS5反代 === 'https') {
 				log(`[HTTPS代理] 代理到: ${host}:${portNum}`);
 				newSocket = isIPHostname(当前parsedSocks5Address.hostname)
-					? await httpsConnect(host, portNum, 本次首包数据, TCP连接)
-					: await httpConnect(host, portNum, 本次首包数据, true, TCP连接);
+					? await httpsConnect(host, portNum, 本次首包数据, TCP连接, 当前parsedSocks5Address)
+					: await httpConnect(host, portNum, 本次首包数据, true, TCP连接, 当前parsedSocks5Address);
 			} else if (当前启用SOCKS5反代 === 'turn') {
 				log(`[TURN代理] 代理到: ${host}:${portNum}`);
 				newSocket = await turnConnect(当前parsedSocks5Address, host, portNum, TCP连接);
@@ -3894,6 +3935,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			connectStreams(initialSocket, ws, respHeader, async () => {
 				if (remoteConnWrapper.socket !== initialSocket) return;
 				await connecttoPry();
+			}).catch(() => closeSocketQuietly(ws)).finally(() => {
+				if (remoteConnWrapper.socket === initialSocket) closeSocketQuietly(ws);
 			});
 		} catch (err) {
 			log(`[TCP转发] 直连 ${host}:${portNum} 失败: ${err.message}`);
@@ -4306,34 +4349,73 @@ function isSpeedTestSite(hostname) {
 }
 
 ///////////////////////////////////////////////////////SOCKS5/HTTP函数///////////////////////////////////////////////
-async function socks5Connect(targetHost, targetPort, initialData, TCP连接) {
-	const { username, password, hostname, port } = parsedSocks5Address;
+async function socks5Connect(targetHost, targetPort, initialData, TCP连接, 代理地址 = parsedSocks5Address) {
+	const { username, password, hostname, port } = 代理地址;
 	const socket = TCP连接({ hostname, port }), writer = socket.writable.getWriter(), reader = socket.readable.getReader();
+	let buffered = new Uint8Array(0), bufferedOffset = 0;
+	const 读取指定字节 = async length => {
+		while (buffered.byteLength - bufferedOffset < length) {
+			const response = await reader.read();
+			if (response.done) throw new Error('S5 connection closed during handshake');
+			const incoming = 数据转Uint8Array(response.value);
+			if (!incoming.byteLength) continue;
+			const remaining = buffered.subarray(bufferedOffset);
+			buffered = 拼接字节数据(remaining, incoming);
+			bufferedOffset = 0;
+		}
+		const result = buffered.subarray(bufferedOffset, bufferedOffset + length);
+		bufferedOffset += length;
+		return result;
+	};
 	try {
 		const authMethods = username && password ? new Uint8Array([0x05, 0x02, 0x00, 0x02]) : new Uint8Array([0x05, 0x01, 0x00]);
 		await writer.write(authMethods);
-		let response = await reader.read();
-		if (response.done || response.value.byteLength < 2) throw new Error('S5 method selection failed');
-
-		const selectedMethod = new Uint8Array(response.value)[1];
+		let response = await 读取指定字节(2);
+		if (response[0] !== 0x05) throw new Error('S5 method selection failed');
+		const selectedMethod = response[1];
 		if (selectedMethod === 0x02) {
 			if (!username || !password) throw new Error('S5 requires authentication');
 			const userBytes = new TextEncoder().encode(username), passBytes = new TextEncoder().encode(password);
 			const authPacket = new Uint8Array([0x01, userBytes.length, ...userBytes, passBytes.length, ...passBytes]);
 			await writer.write(authPacket);
-			response = await reader.read();
-			if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 authentication failed');
+			response = await 读取指定字节(2);
+			if (response[0] !== 0x01 || response[1] !== 0x00) throw new Error('S5 authentication failed');
 		} else if (selectedMethod !== 0x00) throw new Error(`S5 unsupported auth method: ${selectedMethod}`);
 
 		const hostBytes = new TextEncoder().encode(targetHost);
+		if (!hostBytes.length || hostBytes.length > 255) throw new Error('S5 target hostname is invalid');
 		const connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
 		await writer.write(connectPacket);
-		response = await reader.read();
-		if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 connection failed');
+		response = await 读取指定字节(4);
+		if (response[0] !== 0x05 || response[1] !== 0x00) throw new Error('S5 connection failed');
+		const addressLength = response[3] === 0x01 ? 4 : response[3] === 0x04 ? 16 : response[3] === 0x03 ? (await 读取指定字节(1))[0] : -1;
+		if (addressLength < 0) throw new Error('S5 response address type is invalid');
+		await 读取指定字节(addressLength + 2);
 
 		if (有效数据长度(initialData) > 0) await writer.write(initialData);
-		writer.releaseLock(); reader.releaseLock();
-		return socket;
+		writer.releaseLock();
+		const remaining = buffered.subarray(bufferedOffset);
+		if (!remaining.byteLength) {
+			reader.releaseLock();
+			return socket;
+		}
+		let firstChunk = remaining;
+		const readable = new ReadableStream({
+			async pull(controller) {
+				if (firstChunk) {
+					controller.enqueue(firstChunk);
+					firstChunk = null;
+					return;
+				}
+				const next = await reader.read();
+				if (next.done) { reader.releaseLock(); controller.close(); }
+				else controller.enqueue(next.value);
+			},
+			async cancel(reason) {
+				try { await reader.cancel(reason) } finally { try { reader.releaseLock() } catch (_) { } }
+			}
+		});
+		return { readable, writable: socket.writable, opened: socket.opened, closed: socket.closed, close: () => socket.close() };
 	} catch (error) {
 		try { writer.releaseLock() } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
@@ -4342,8 +4424,8 @@ async function socks5Connect(targetHost, targetPort, initialData, TCP连接) {
 	}
 }
 
-async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = false, TCP连接) {
-	const { username, password, hostname, port } = parsedSocks5Address;
+async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = false, TCP连接, 代理地址 = parsedSocks5Address) {
+	const { username, password, hostname, port } = 代理地址;
 	const socket = HTTPS代理
 		? TCP连接({ hostname, port }, { secureTransport: 'on', allowHalfOpen: false })
 		: TCP连接({ hostname, port });
@@ -4400,8 +4482,8 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 	}
 }
 
-async function httpsConnect(targetHost, targetPort, initialData, TCP连接) {
-	const { username, password, hostname, port } = parsedSocks5Address;
+async function httpsConnect(targetHost, targetPort, initialData, TCP连接, 代理地址 = parsedSocks5Address) {
+	const { username, password, hostname, port } = 代理地址;
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
 	let tlsSocket = null;
@@ -7283,10 +7365,23 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 	return [Array.from(results), LINK数组, 需要订阅转换订阅URLs, Array.from(反代IP池)];
 }
 
-async function 反代参数获取(url, uuid) {
+async function 反代参数获取(url, uuid, 初始反代上下文 = {}) {
 	const { searchParams } = url;
 	const pathname = decodeURIComponent(url.pathname);
 	const pathLower = pathname.toLowerCase();
+	let 本次反代IP = 初始反代上下文.反代IP ?? 反代IP;
+	let 本次启用反代兜底 = 初始反代上下文.启用反代兜底 ?? 启用反代兜底;
+	let 本次启用SOCKS5反代 = null;
+	let 本次启用SOCKS5全局反代 = searchParams.has('globalproxy');
+	let 本次SOCKS5账号 = searchParams.get('socks5') || searchParams.get('http') || searchParams.get('https') || searchParams.get('turn') || searchParams.get('sstp') || null;
+	let 本次代理地址 = {};
+	const 构建反代上下文 = () => ({
+		反代IP: 本次反代IP,
+		启用反代兜底: 本次启用反代兜底,
+		启用SOCKS5反代: 本次启用SOCKS5反代,
+		启用SOCKS5全局反代: 本次启用SOCKS5全局反代,
+		parsedSocks5Address: 本次代理地址
+	});
 
 	const 链式代理路径匹配 = pathname.match(/\/video\/(.+)$/i);
 	if (链式代理路径匹配) {
@@ -7295,45 +7390,45 @@ async function 反代参数获取(url, uuid) {
 			const { type, ...链式代理地址 } = JSON.parse(链式代理明文);
 			if (!type || !反代协议默认端口[String(type).toLowerCase()]) throw new Error('链式代理类型无效');
 			if (!链式代理地址.hostname || !链式代理地址.port) throw new Error('链式代理地址缺少 hostname 或 port');
-			我的SOCKS5账号 = '';
-			反代IP = '链式代理';
-			启用反代兜底 = false;
-			启用SOCKS5全局反代 = true;
-			启用SOCKS5反代 = String(type).toLowerCase();
-			parsedSocks5Address = {
+			const 链式代理配置 = {
+				反代IP: '链式代理',
+				启用反代兜底: false,
+				启用SOCKS5全局反代: true,
+				启用SOCKS5反代: String(type).toLowerCase(),
+				parsedSocks5Address: {
 				username: 链式代理地址.username,
 				password: 链式代理地址.password,
 				hostname: 链式代理地址.hostname,
 				port: Number(链式代理地址.port)
+				}
 			};
-			if (isNaN(parsedSocks5Address.port)) throw new Error('链式代理端口无效');
-			return;
+			if (isNaN(链式代理配置.parsedSocks5Address.port)) throw new Error('链式代理端口无效');
+			return 链式代理配置;
 		} catch (err) {
 			console.error('解析链式代理参数失败:', err.message);
 		}
 	}
 
-	我的SOCKS5账号 = searchParams.get('socks5') || searchParams.get('http') || searchParams.get('https') || searchParams.get('turn') || searchParams.get('sstp') || null;
-	启用SOCKS5全局反代 = searchParams.has('globalproxy');
-	if (searchParams.get('socks5')) 启用SOCKS5反代 = 'socks5';
-	else if (searchParams.get('http')) 启用SOCKS5反代 = 'http';
-	else if (searchParams.get('https')) 启用SOCKS5反代 = 'https';
-	else if (searchParams.get('turn')) 启用SOCKS5反代 = 'turn';
-	else if (searchParams.get('sstp')) 启用SOCKS5反代 = 'sstp';
+	if (searchParams.get('socks5')) 本次启用SOCKS5反代 = 'socks5';
+	else if (searchParams.get('http')) 本次启用SOCKS5反代 = 'http';
+	else if (searchParams.get('https')) 本次启用SOCKS5反代 = 'https';
+	else if (searchParams.get('turn')) 本次启用SOCKS5反代 = 'turn';
+	else if (searchParams.get('sstp')) 本次启用SOCKS5反代 = 'sstp';
 
 	const 解析代理URL = (值, 强制全局 = true) => {
 		const 匹配 = /^(socks5|http|https|turn|sstp):\/\/(.+)$/i.exec(值 || '');
 		if (!匹配) return false;
-		启用SOCKS5反代 = 匹配[1].toLowerCase();
-		我的SOCKS5账号 = 匹配[2].split('/')[0];
-		if (强制全局) 启用SOCKS5全局反代 = true;
+		本次启用SOCKS5反代 = 匹配[1].toLowerCase();
+		本次SOCKS5账号 = 匹配[2].split('/')[0];
+		if (强制全局) 本次启用SOCKS5全局反代 = true;
 		return true;
 	};
 
 	const 设置反代IP = (值) => {
-		反代IP = 值;
-		启用SOCKS5反代 = null;
-		启用反代兜底 = false;
+		本次反代IP = 值;
+		本次启用SOCKS5反代 = null;
+		本次启用反代兜底 = false;
+		return 构建反代上下文();
 	};
 
 	const 提取路径值 = (值) => {
@@ -7354,37 +7449,38 @@ async function 反代参数获取(url, uuid) {
 		let 匹配 = /\/(socks5?|http|https|turn|sstp):\/?\/?([^/?#\s]+)/i.exec(pathname);
 		if (匹配) {
 			const 类型 = 匹配[1].toLowerCase();
-			启用SOCKS5反代 = 类型 === 'sock' || 类型 === 'socks' ? 'socks5' : 类型;
-			我的SOCKS5账号 = 匹配[2].split('/')[0];
-			启用SOCKS5全局反代 = true;
+			本次启用SOCKS5反代 = 类型 === 'sock' || 类型 === 'socks' ? 'socks5' : 类型;
+			本次SOCKS5账号 = 匹配[2].split('/')[0];
+			本次启用SOCKS5全局反代 = true;
 		} else if ((匹配 = /\/(g?s5|socks5|g?http|g?https|g?turn|g?sstp)=([^/?#\s]+)/i.exec(pathname))) {
 			const 类型 = 匹配[1].toLowerCase();
-			我的SOCKS5账号 = 匹配[2].split('/')[0];
-			启用SOCKS5反代 = 类型.includes('sstp') ? 'sstp' : (类型.includes('turn') ? 'turn' : (类型.includes('https') ? 'https' : (类型.includes('http') ? 'http' : 'socks5')));
-			if (类型.startsWith('g')) 启用SOCKS5全局反代 = true;
+			本次SOCKS5账号 = 匹配[2].split('/')[0];
+			本次启用SOCKS5反代 = 类型.includes('sstp') ? 'sstp' : (类型.includes('turn') ? 'turn' : (类型.includes('https') ? 'https' : (类型.includes('http') ? 'http' : 'socks5')));
+			if (类型.startsWith('g')) 本次启用SOCKS5全局反代 = true;
 		} else if ((匹配 = /\/(proxyip[.=]|pyip=|ip=)([^?#\s]+)/.exec(pathLower))) {
 			const 路径反代值 = 提取路径值(匹配[2]);
 			if (!解析代理URL(路径反代值)) return 设置反代IP(路径反代值);
 		}
 	}
 
-	if (!我的SOCKS5账号) {
-		启用SOCKS5反代 = null;
-		return;
+	if (!本次SOCKS5账号) {
+		本次启用SOCKS5反代 = null;
+		return 构建反代上下文();
 	}
 
 	try {
-		parsedSocks5Address = await 获取SOCKS5账号(我的SOCKS5账号, 获取代理默认端口(启用SOCKS5反代));
-		if (searchParams.get('socks5')) 启用SOCKS5反代 = 'socks5';
-		else if (searchParams.get('http')) 启用SOCKS5反代 = 'http';
-		else if (searchParams.get('https')) 启用SOCKS5反代 = 'https';
-		else if (searchParams.get('turn')) 启用SOCKS5反代 = 'turn';
-		else if (searchParams.get('sstp')) 启用SOCKS5反代 = 'sstp';
-		else 启用SOCKS5反代 = 启用SOCKS5反代 || 'socks5';
+		本次代理地址 = await 获取SOCKS5账号(本次SOCKS5账号, 获取代理默认端口(本次启用SOCKS5反代));
+		if (searchParams.get('socks5')) 本次启用SOCKS5反代 = 'socks5';
+		else if (searchParams.get('http')) 本次启用SOCKS5反代 = 'http';
+		else if (searchParams.get('https')) 本次启用SOCKS5反代 = 'https';
+		else if (searchParams.get('turn')) 本次启用SOCKS5反代 = 'turn';
+		else if (searchParams.get('sstp')) 本次启用SOCKS5反代 = 'sstp';
+		else 本次启用SOCKS5反代 = 本次启用SOCKS5反代 || 'socks5';
 	} catch (err) {
 		console.error('解析SOCKS5地址失败:', err.message);
-		启用SOCKS5反代 = null;
+		本次启用SOCKS5反代 = null;
 	}
+	return 构建反代上下文();
 }
 
 const 反代协议默认端口 = { socks5: 1080, http: 80, https: 443, turn: 3478, sstp: 443 };
@@ -7733,12 +7829,13 @@ async function html1101(host, 访问IP) {
 </html>`;
 }
 
-// 仅导出无副作用的关键规则，供 Node 自动化测试验证；Worker 默认导出保持不变。
+// 导出关键逻辑供 Node 自动化测试验证；Worker 默认导出保持不变。
 export const __test = Object.freeze({
 	获取访问记录状态错误,
 	访问限制错误,
 	模拟访问链接激活,
 	计算续期到期时间,
+	计算访问链接续期到期时间,
 	获取访问恢复错误,
 	模拟重置访问链接,
 	生成轮换访问凭据,
@@ -7750,5 +7847,11 @@ export const __test = Object.freeze({
 	标准化访问数据源URL,
 	验证管理员修改请求,
 	SHA256十六进制,
-	生成随机访问令牌
+	生成随机访问令牌,
+	反代参数获取,
+	获取TCP反代配置,
+	forwardataTCP,
+	处理XHTTP请求,
+	socks5Connect,
+	访问链接增强管理页面
 });

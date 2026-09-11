@@ -53,6 +53,13 @@ test('续期从当前时间或原到期时间中较晚者开始', () => {
   assert.equal(__test.计算续期到期时间(3000, 4000, 1), 3_604_000);
 });
 
+test('未使用链接续期只增加可用时长且不提前开始倒计时', () => {
+  const unused = base({ duration_seconds: 3 * 3600, first_used_at: null, expires_at: null });
+  assert.equal(__test.计算访问链接续期到期时间(unused, 5000, 1), null);
+  const used = base({ first_used_at: 1000, expires_at: 4000 });
+  assert.equal(__test.计算访问链接续期到期时间(used, 5000, 1), 3_605_000);
+});
+
 test('重置计时清除分配、绑定和统计并增加连接代次', () => {
   const result = __test.模拟重置访问链接(base({ proxy_ip: 'proxy.example', first_used_at: 1, expires_at: 2, connection_count: 9, active_connections: 2, bound_ip: '203.0.113.8', connection_epoch: 4 }));
   assert.equal(result.proxy_ip, null);
@@ -130,4 +137,109 @@ test('外部数据源仅允许 HTTPS 且阻止本地与私网地址', () => {
   assert.throws(() => __test.标准化访问数据源URL('https://127.0.0.1/list'), /本地或私有/);
   assert.throws(() => __test.标准化访问数据源URL('https://192.168.1.2/list'), /本地或私有/);
   assert.throws(() => __test.标准化访问数据源URL('https://[::1]/list'), /本地或私有/);
+});
+
+test('每个请求独立保存代理配置且显式关闭 SOCKS 不回退到全局值', async () => {
+  const baseProxy = { 反代IP: 'fallback.example', 启用反代兜底: true, 启用SOCKS5反代: null, 启用SOCKS5全局反代: false, parsedSocks5Address: {} };
+  const [first, second] = await Promise.all([
+    __test.反代参数获取(new URL('https://example.com/?socks5=proxy-a.example:1080'), '', baseProxy),
+    __test.反代参数获取(new URL('https://example.com/?socks5=proxy-b.example:1080'), '', baseProxy)
+  ]);
+  assert.equal(first.parsedSocks5Address.hostname, 'proxy-a.example');
+  assert.equal(second.parsedSocks5Address.hostname, 'proxy-b.example');
+  assert.notEqual(first.parsedSocks5Address, second.parsedSocks5Address);
+  assert.equal(__test.获取TCP反代配置().启用SOCKS5反代, null);
+  const accessProxy = __test.获取TCP反代配置({ ...baseProxy, 启用SOCKS5反代: null });
+  assert.equal(accessProxy.启用SOCKS5反代, null);
+});
+
+test('管理页面渲染后的内嵌脚本可被浏览器解析', async () => {
+  const response = __test.访问链接增强管理页面();
+  const html = await response.text();
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(script, '管理页面应包含内嵌脚本');
+  assert.doesNotThrow(() => new Function(script));
+  assert.match(script, /'\\n→\\n'/);
+});
+
+test('并发 TCP 拨号不会在调用连接器前引用未定义变量', async () => {
+  const opened = [];
+  const pending = new ReadableStream();
+  const request = {
+    fetcher: {
+      connect(options) {
+        opened.push(options);
+        return {
+          opened: Promise.resolve(),
+          closed: new Promise(() => {}),
+          readable: pending,
+          writable: new WritableStream(),
+          close() {}
+        };
+      }
+    }
+  };
+  const bridge = { readyState: WebSocket.OPEN, send() {}, close() { this.readyState = WebSocket.CLOSED; } };
+  await __test.forwardataTCP('203.0.113.10', 443, new Uint8Array([1]), bridge, null, {}, base().uuid, request, {
+    反代IP: '203.0.113.11',
+    启用反代兜底: false,
+    启用SOCKS5反代: null
+  });
+  assert.equal(opened.length, 2);
+});
+
+test('SOCKS5 握手支持分包并保留下游同包数据', async () => {
+  const chunks = [
+    new Uint8Array([0x05]),
+    new Uint8Array([0x00]),
+    new Uint8Array([0x05, 0x00]),
+    new Uint8Array([0x00, 0x01, 0, 0]),
+    new Uint8Array([0, 0, 0, 0, 9, 8])
+  ];
+  let index = 0;
+  const socket = {
+    readable: new ReadableStream({ pull(controller) { index < chunks.length ? controller.enqueue(chunks[index++]) : controller.close(); } }),
+    writable: new WritableStream(),
+    closed: new Promise(() => {}),
+    close() {}
+  };
+  const connected = await __test.socks5Connect('example.com', 443, new Uint8Array(), () => socket, { hostname: 'proxy.example', port: 1080 });
+  const first = await connected.readable.getReader().read();
+  assert.deepEqual(Array.from(first.value), [9, 8]);
+});
+
+test('XHTTP 上传结束后保留租约直到下行连接结束', async () => {
+  const uuid = base().uuid;
+  const requestHeader = new Uint8Array([0, ...Buffer.from(uuid.replaceAll('-', ''), 'hex'), 0, 1, 1, 187, 1, 203, 0, 113, 10, 65]);
+  const statements = [];
+  const DB = {
+    prepare(sql) { return { sql, bind() { return this; }, async run() { return { meta: { changes: 1 } }; }, async first() { return record; } }; },
+    async batch(items) { statements.push(...items.map(item => item.sql)); return []; }
+  };
+  const record = base({ expires_at: Date.now() + 60_000 });
+  const context = { 记录: record, env: { DB }, 激活任务: Promise.resolve(record), leaseId: 'lease-1', 代理连接成功: true, 已释放: false };
+  context.反代上下文 = { 反代IP: '203.0.113.11', 启用反代兜底: false, 启用SOCKS5反代: null, 访问授权上下文: context };
+  const request = {
+    body: new ReadableStream({ start(controller) { controller.enqueue(requestHeader); controller.close(); } }),
+    fetcher: {
+      connect() {
+        return {
+          opened: Promise.resolve(),
+          closed: new Promise(() => {}),
+          readable: new ReadableStream(),
+          writable: new WritableStream(),
+          close() {}
+        };
+      }
+    }
+  };
+  const response = await __test.处理XHTTP请求(request, uuid, context);
+  try {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(context.已释放, false);
+    assert.equal(statements.some(sql => sql.startsWith('DELETE FROM access_connection_leases')), false);
+  } finally {
+    await response.body.cancel();
+  }
+  assert.equal(context.已释放, true);
 });
