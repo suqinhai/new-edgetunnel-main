@@ -535,11 +535,22 @@ export default {
 			return 反代响应;
 		} catch (error) { }
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+	},
+	async scheduled(controller, env, ctx) {
+		ctx.waitUntil((async () => {
+			await 确保访问数据库(env);
+			const result = await env.DB.prepare("SELECT DISTINCT country FROM access_links WHERE status = 'active' ORDER BY country LIMIT 20").all();
+			for (const item of result.results || []) {
+				await 同步到期访问PROXYIP数据源(env, { country: item.country });
+			}
+		})());
 	}
 };
 
 ///////////////////////////////////////////////////////限时访问链接///////////////////////////////////////////////
 const 访问令牌正则 = /^[A-Za-z0-9_-]{43}$/;
+const 内置访问PROXYIP数据源URL = 'https://zip.cm.edu.kg.cmliussss.net/all.json';
+const 访问PROXYIP检测URL = 'https://api.090227.xyz/check?proxyip=';
 
 function 提取路径访问令牌(pathname) {
 	try {
@@ -574,8 +585,9 @@ function 访问JSON响应(data, status = 200) {
 async function 确保访问数据库(env) {
 	if (!env.DB || typeof env.DB.prepare !== 'function') throw new Error('请先绑定名为 DB 的 D1 数据库');
 	if (!访问数据库初始化任务) {
-		访问数据库初始化任务 = env.DB.batch([
-			env.DB.prepare(`CREATE TABLE IF NOT EXISTS access_links (
+		访问数据库初始化任务 = (async () => {
+			await env.DB.batch([
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS access_links (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				token TEXT NOT NULL UNIQUE,
 				uuid TEXT NOT NULL UNIQUE,
@@ -588,19 +600,66 @@ async function 确保访问数据库(env) {
 				first_used_at INTEGER,
 				expires_at INTEGER,
 				last_used_at INTEGER
-			)`),
-			env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_links_status_expires ON access_links(status, expires_at)'),
-			env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_links_country ON access_links(country)'),
-			env.DB.prepare(`CREATE TABLE IF NOT EXISTS proxy_ip_pool (
+				)`),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_links_status_expires ON access_links(status, expires_at)'),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_links_country ON access_links(country)'),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS proxy_ip_pool (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				country TEXT NOT NULL,
 				proxy_ip TEXT NOT NULL,
 				enabled INTEGER NOT NULL DEFAULT 1,
 				created_at INTEGER NOT NULL,
 				UNIQUE(country, proxy_ip)
-			)`),
-			env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_country_enabled ON proxy_ip_pool(country, enabled)')
-		]).catch(error => {
+				)`),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS proxy_ip_sources (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					name TEXT NOT NULL,
+					url TEXT NOT NULL UNIQUE,
+					default_country TEXT NOT NULL DEFAULT '',
+					enabled INTEGER NOT NULL DEFAULT 1,
+					refresh_minutes INTEGER NOT NULL DEFAULT 30,
+					max_per_country INTEGER NOT NULL DEFAULT 100,
+					last_synced_at INTEGER,
+					last_status TEXT NOT NULL DEFAULT 'never',
+					last_error TEXT NOT NULL DEFAULT '',
+					created_at INTEGER NOT NULL,
+					updated_at INTEGER NOT NULL
+				)`),
+				env.DB.prepare(`CREATE TABLE IF NOT EXISTS proxy_ip_source_sync (
+					source_id INTEGER NOT NULL,
+					country TEXT NOT NULL,
+					last_synced_at INTEGER NOT NULL,
+					last_status TEXT NOT NULL,
+					last_error TEXT NOT NULL DEFAULT '',
+					PRIMARY KEY(source_id, country)
+				)`),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_country_enabled ON proxy_ip_pool(country, enabled)')
+			]);
+
+			const 列结果 = await env.DB.prepare('PRAGMA table_info(proxy_ip_pool)').all();
+			const 已有列 = new Set((列结果.results || []).map(item => item.name));
+			const 新列 = [
+				['source_id', 'INTEGER'],
+				['health_status', "TEXT NOT NULL DEFAULT 'unknown'"],
+				['latency_ms', 'INTEGER'],
+				['failure_count', 'INTEGER NOT NULL DEFAULT 0'],
+				['last_checked_at', 'INTEGER'],
+				['last_success_at', 'INTEGER'],
+				['last_error', "TEXT NOT NULL DEFAULT ''"],
+				['updated_at', 'INTEGER NOT NULL DEFAULT 0']
+			];
+			for (const [列名, 定义] of 新列) {
+				if (!已有列.has(列名)) await env.DB.prepare(`ALTER TABLE proxy_ip_pool ADD COLUMN ${列名} ${定义}`).run();
+			}
+			await env.DB.batch([
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_source ON proxy_ip_pool(source_id)'),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_health ON proxy_ip_pool(country, enabled, health_status, failure_count)')
+			]);
+			const now = Date.now();
+			await env.DB.prepare(`INSERT OR IGNORE INTO proxy_ip_sources
+				(name, url, default_country, enabled, refresh_minutes, max_per_country, last_status, created_at, updated_at)
+				VALUES ('CM科技大学内置列表', ?1, '', 1, 60, 100, 'never', ?2, ?2)`).bind(内置访问PROXYIP数据源URL, now).run();
+		})().catch(error => {
 			访问数据库初始化任务 = null;
 			throw error;
 		});
@@ -639,12 +698,19 @@ async function 激活访问授权上下文(上下文) {
 		const 读取错误 = 获取访问记录状态错误(记录);
 		if (读取错误) throw Object.assign(new Error(读取错误.message), { status: 读取错误.status });
 
-		let 选定反代IP = 记录.proxy_ip;
-		if (!选定反代IP) {
-			const IP记录 = await session.prepare('SELECT proxy_ip FROM proxy_ip_pool WHERE country = ?1 AND enabled = 1 ORDER BY RANDOM() LIMIT 1').bind(记录.country).first();
-			选定反代IP = IP记录?.proxy_ip || null;
-			if (!选定反代IP) throw Object.assign(new Error(`国家 ${记录.country} 暂无可用 PROXYIP`), { status: 503 });
+		const 查询候选 = () => session.prepare(`SELECT proxy_ip FROM proxy_ip_pool
+			WHERE country = ?1 AND enabled = 1 AND health_status <> 'unhealthy'
+			ORDER BY CASE WHEN proxy_ip = ?2 THEN 0 ELSE 1 END,
+				CASE health_status WHEN 'healthy' THEN 0 ELSE 1 END,
+				failure_count ASC, latency_ms ASC, RANDOM() LIMIT 8`).bind(记录.country, 记录.proxy_ip || '').all();
+		let IP结果 = await 查询候选();
+		if (!(IP结果.results || []).length) {
+			await 同步到期访问PROXYIP数据源(上下文.env, { country: 记录.country });
+			IP结果 = await 查询候选();
 		}
+		const 候选反代IP = (IP结果.results || []).map(item => item.proxy_ip);
+		const 选定反代IP = 候选反代IP[0] || null;
+		if (!选定反代IP) throw Object.assign(new Error(`国家 ${记录.country} 暂无可用 PROXYIP`), { status: 503 });
 
 		const now = Date.now();
 		await session.prepare(`UPDATE access_links
@@ -660,7 +726,7 @@ async function 激活访问授权上下文(上下文) {
 
 		上下文.记录 = 记录;
 		上下文.反代上下文 = {
-			反代IP: 记录.proxy_ip,
+			反代IP: 候选反代IP.join(','),
 			启用反代兜底: false,
 			启用SOCKS5反代: null,
 			启用SOCKS5全局反代: false,
@@ -776,8 +842,298 @@ function 生成访问国家选项() {
 function 标准化访问PROXYIP(value) {
 	let proxy = String(value || '').trim().replace(/^(?:proxyip|https?|socks5):\/\//i, '');
 	proxy = proxy.split(/[/?#]/)[0].trim();
-	if (!proxy || proxy.length > 300 || /[\s@]/.test(proxy) || !/^[A-Za-z0-9.[\]:_-]+$/.test(proxy)) throw new Error(`无效的 PROXYIP：${value}`);
+	if (!proxy || proxy.length > 300 || /[\s@]/.test(proxy) || !/^[A-Za-z0-9.[\]:_-]+$/.test(proxy) || (!proxy.includes('.') && !proxy.includes(':'))) throw new Error(`无效的 PROXYIP：${value}`);
 	return proxy;
+}
+
+function 标准化访问数据源URL(value) {
+	let url;
+	try { url = new URL(String(value || '').trim()); } catch (_) { throw new Error('数据源 URL 格式不正确'); }
+	if (url.protocol !== 'https:' || url.username || url.password || url.href.length > 2000) throw new Error('数据源必须使用不含账号密码的 HTTPS URL');
+	const hostname = url.hostname.toLowerCase();
+	if (hostname === 'localhost' || hostname.endsWith('.local') || /^127\./.test(hostname) || /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^169\.254\./.test(hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) || /^\[(?:::1|f[cd]|fe8)/i.test(hostname)) throw new Error('数据源地址不允许指向本地或私有网络');
+	return url.href;
+}
+
+function 解析访问PROXYIP数据源(text, defaultCountry = '') {
+	const entries = [], seen = new Set();
+	let skipped = 0;
+	const add = (proxyValue, countryValue = defaultCountry) => {
+		try {
+			const country = 标准化访问国家(countryValue);
+			const proxy_ip = 标准化访问PROXYIP(proxyValue);
+			const key = `${country}\n${proxy_ip.toLowerCase()}`;
+			if (!seen.has(key)) {
+				seen.add(key);
+				entries.push({ country, proxy_ip });
+			}
+		} catch (_) { skipped++; }
+	};
+	const countryFrom = value => {
+		try { return 标准化访问国家(value); } catch (_) { return ''; }
+	};
+	const walk = (value, inheritedCountry = defaultCountry, depth = 0) => {
+		if (depth > 6 || value == null || entries.length >= 25000) return;
+		if (Array.isArray(value)) {
+			for (const item of value) walk(item, inheritedCountry, depth + 1);
+			return;
+		}
+		if (typeof value === 'string' || typeof value === 'number') {
+			add(String(value), inheritedCountry);
+			return;
+		}
+		if (typeof value !== 'object') return;
+		const proxy = value.proxy_ip ?? value.proxyIp ?? value.proxyip ?? value.address ?? value.endpoint ?? value.ip ?? value.host;
+		if (proxy != null) {
+			const country = value.country_code ?? value.countryCode ?? value.country ?? value.cc ?? value.region ?? value.meta?.country ?? value.meta?.colo?.cca2 ?? inheritedCountry;
+			const ports = Array.isArray(value.port) ? value.port : [value.port];
+			const validPorts = ports.map(Number).filter(port => Number.isInteger(port) && port > 0 && port <= 65535);
+			if (validPorts.length && !String(proxy).includes(':')) {
+				if (validPorts.includes(443)) add(proxy, country);
+				else for (const port of validPorts) add(`${proxy}:${port}`, country);
+			} else add(proxy, country);
+			return;
+		}
+		for (const [key, child] of Object.entries(value)) walk(child, countryFrom(key) || inheritedCountry, depth + 1);
+	};
+
+	const input = String(text || '').replace(/^\uFEFF/, '').trim();
+	if (!input) return { entries, skipped };
+	try {
+		walk(JSON.parse(input));
+	} catch (_) {
+		const lines = input.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#') && !line.startsWith('//'));
+		let headers = null;
+		if (lines.length) {
+			const possibleHeaders = lines[0].split(/[,\t|;]/).map(item => item.trim().toLowerCase());
+			if (possibleHeaders.some(item => /^(ip|host|address|endpoint|proxy|proxyip|proxy_ip)$/.test(item))) {
+				headers = possibleHeaders;
+				lines.shift();
+			}
+		}
+		for (const line of lines.slice(0, 25000)) {
+			const columns = line.split(/[,\t|;]/).map(item => item.trim()).filter(Boolean);
+			if (headers) {
+				const get = names => {
+					const index = headers.findIndex(header => names.includes(header));
+					return index >= 0 ? columns[index] : '';
+				};
+				const host = get(['ip', 'host', 'address', 'endpoint', 'proxy', 'proxyip', 'proxy_ip']);
+				const port = get(['port']);
+				add(port && host && !host.includes(':') ? `${host}:${port}` : host, get(['country', 'country_code', 'countrycode', 'cc', 'region']) || defaultCountry);
+				continue;
+			}
+			let country = defaultCountry;
+			for (const column of columns) {
+				const detected = countryFrom(column);
+				if (detected) { country = detected; break; }
+			}
+			let proxy = columns.find(column => !countryFrom(column)) || line;
+			const remarkMatch = line.match(/^(.+?)#\s*([^#]+)$/);
+			if (remarkMatch) {
+				proxy = remarkMatch[1].trim();
+				country = countryFrom(remarkMatch[2]) || country;
+			}
+			add(proxy, country);
+		}
+	}
+	return { entries, skipped };
+}
+
+function 读取ZIP小端整数(bytes, offset, size) {
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	if (size === 2) return view.getUint16(offset, true);
+	if (size === 4) return view.getUint32(offset, true);
+	return 0;
+}
+
+async function 解压访问PROXYIPZIP条目(buffer, names) {
+	const bytes = new Uint8Array(buffer);
+	const wanted = new Set(names);
+	const entries = new Map();
+	const start = Math.max(0, bytes.length - 0x10000 - 22);
+	let eocd = -1;
+	for (let offset = bytes.length - 22; offset >= start; offset--) {
+		if (读取ZIP小端整数(bytes, offset, 4) === 0x06054b50) { eocd = offset; break; }
+	}
+	if (eocd < 0) throw new Error('内置 PROXYIP ZIP 文件格式不正确');
+	const centralOffset = 读取ZIP小端整数(bytes, eocd + 16, 4);
+	const centralSize = 读取ZIP小端整数(bytes, eocd + 12, 4);
+	let offset = centralOffset;
+	const decoder = new TextDecoder();
+	while (offset + 46 <= bytes.length && offset < centralOffset + centralSize) {
+		if (读取ZIP小端整数(bytes, offset, 4) !== 0x02014b50) break;
+		const compressedSize = 读取ZIP小端整数(bytes, offset + 20, 4);
+		const method = 读取ZIP小端整数(bytes, offset + 10, 2);
+		const nameLength = 读取ZIP小端整数(bytes, offset + 28, 2);
+		const extraLength = 读取ZIP小端整数(bytes, offset + 30, 2);
+		const commentLength = 读取ZIP小端整数(bytes, offset + 32, 2);
+		const localOffset = 读取ZIP小端整数(bytes, offset + 42, 4);
+		const name = decoder.decode(bytes.slice(offset + 46, offset + 46 + nameLength));
+		if (wanted.has(name)) entries.set(name, { compressedSize, method, localOffset });
+		offset += 46 + nameLength + extraLength + commentLength;
+	}
+	const output = new Map();
+	for (const name of wanted) {
+		const entry = entries.get(name);
+		if (!entry) continue;
+		const local = entry.localOffset;
+		if (读取ZIP小端整数(bytes, local, 4) !== 0x04034b50) continue;
+		const nameLength = 读取ZIP小端整数(bytes, local + 26, 2);
+		const extraLength = 读取ZIP小端整数(bytes, local + 28, 2);
+		const dataStart = local + 30 + nameLength + extraLength;
+		const compressed = bytes.slice(dataStart, dataStart + entry.compressedSize);
+		let content = compressed;
+		if (entry.method === 8) {
+			if (typeof DecompressionStream !== 'function') throw new Error('当前运行环境不支持 ZIP 解压');
+			const stream = new DecompressionStream('deflate-raw');
+			content = new Uint8Array(await new Response(new Blob([compressed]).stream().pipeThrough(stream)).arrayBuffer());
+		} else if (entry.method !== 0) {
+			throw new Error(`内置 PROXYIP ZIP 使用不支持的压缩方式：${entry.method}`);
+		}
+		output.set(name, decoder.decode(content));
+	}
+	return output;
+}
+
+async function 获取访问PROXYIP数据源内容(source, targetCountry = '') {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 20000);
+	try {
+		if (source.url === 内置访问PROXYIP数据源URL && targetCountry) {
+			const zipUrl = source.url.replace(/\/all\.json$/i, '/ip.zip');
+			const response = await fetch(zipUrl, { headers: { Accept: 'application/zip,*/*;q=0.1', 'User-Agent': 'edgetunnel-proxy-pool/1.0' }, signal: controller.signal, redirect: 'follow' });
+			if (!response.ok) throw new Error(`数据源返回 HTTP ${response.status}`);
+			const contentLength = Number(response.headers.get('content-length') || 0);
+			if (contentLength > 20 * 1024 * 1024) throw new Error('数据源内容超过 20MB');
+			const buffer = await response.arrayBuffer();
+			if (buffer.byteLength > 20 * 1024 * 1024) throw new Error('数据源内容超过 20MB');
+			const ports = [443, 8443, 2053, 2083, 2087, 2096];
+			const names = ports.map(port => `${port}/${targetCountry}.txt`);
+			const files = await 解压访问PROXYIPZIP条目(buffer, names);
+			const parts = [];
+			for (const port of ports) {
+				const file = files.get(`${port}/${targetCountry}.txt`);
+				if (!file) continue;
+				for (const line of file.split(/\r?\n/).map(item => item.trim()).filter(Boolean)) parts.push(port === 443 || line.includes(':') ? line : `${line}:${port}`);
+			}
+			return parts.join('\n');
+		}
+		const response = await fetch(source.url, { headers: { Accept: 'application/json,text/plain,text/csv;q=0.9,*/*;q=0.1', 'User-Agent': 'edgetunnel-proxy-pool/1.0' }, signal: controller.signal, redirect: 'follow' });
+		if (!response.ok) throw new Error(`数据源返回 HTTP ${response.status}`);
+		const contentLength = Number(response.headers.get('content-length') || 0);
+		if (contentLength > 20 * 1024 * 1024) throw new Error('数据源内容超过 20MB');
+		const text = await response.text();
+		if (text.length > 20 * 1024 * 1024) throw new Error('数据源内容超过 20MB');
+		return text;
+	} catch (error) {
+		if (error?.name === 'AbortError') throw new Error('数据源请求超时');
+		throw error;
+	} finally { clearTimeout(timer); }
+}
+
+async function 同步单个访问PROXYIP数据源(env, source, targetCountry = '') {
+	const now = Date.now();
+	try {
+		const text = await 获取访问PROXYIP数据源内容(source, targetCountry);
+		const parsed = 解析访问PROXYIP数据源(text, targetCountry || source.default_country || '');
+		const grouped = new Map();
+		for (const entry of parsed.entries) {
+			if (targetCountry && entry.country !== targetCountry) continue;
+			if (!grouped.has(entry.country)) grouped.set(entry.country, []);
+			if (grouped.get(entry.country).length < Number(source.max_per_country || 100)) grouped.get(entry.country).push(entry);
+		}
+		const entries = [...grouped.values()].flat().slice(0, 5000);
+		if (!entries.length) throw new Error(source.default_country ? '数据源中没有可识别的 PROXYIP' : '数据源缺少国家字段，请设置默认国家');
+		for (let index = 0; index < entries.length; index += 50) {
+			await env.DB.batch(entries.slice(index, index + 50).map(entry => env.DB.prepare(`INSERT INTO proxy_ip_pool
+				(country, proxy_ip, enabled, created_at, source_id, health_status, failure_count, last_error, updated_at)
+				VALUES (?1, ?2, 1, ?3, ?4, 'unknown', 0, '', ?3)
+				ON CONFLICT(country, proxy_ip) DO UPDATE SET enabled = 1, source_id = ?4, updated_at = ?3`)
+				.bind(entry.country, entry.proxy_ip, now, source.id)));
+		}
+		const 删除过期语句 = targetCountry
+			? env.DB.prepare('DELETE FROM proxy_ip_pool WHERE source_id = ?1 AND country = ?2 AND updated_at <> ?3').bind(source.id, targetCountry, now)
+			: env.DB.prepare('DELETE FROM proxy_ip_pool WHERE source_id = ?1 AND updated_at <> ?2').bind(source.id, now);
+		const 同步记录语句 = targetCountry
+			? env.DB.prepare(`INSERT INTO proxy_ip_source_sync(source_id, country, last_synced_at, last_status, last_error)
+				VALUES (?1, ?2, ?3, 'success', '') ON CONFLICT(source_id, country) DO UPDATE SET
+				last_synced_at = ?3, last_status = 'success', last_error = ''`).bind(source.id, targetCountry, now)
+			: env.DB.prepare("UPDATE proxy_ip_sources SET updated_at = ?1 WHERE id = ?2").bind(now, source.id);
+		await env.DB.batch([
+			删除过期语句,
+			同步记录语句,
+			env.DB.prepare("UPDATE proxy_ip_sources SET last_synced_at = ?1, last_status = 'success', last_error = '', updated_at = ?1 WHERE id = ?2").bind(now, source.id)
+		]);
+		return { id: source.id, name: source.name, success: true, imported: entries.length, countries: grouped.size, skipped: parsed.skipped };
+	} catch (error) {
+		const message = String(error?.message || error).slice(0, 300);
+		const statements = [env.DB.prepare("UPDATE proxy_ip_sources SET last_synced_at = ?1, last_status = 'error', last_error = ?2, updated_at = ?1 WHERE id = ?3").bind(now, message, source.id)];
+		if (targetCountry) statements.push(env.DB.prepare(`INSERT INTO proxy_ip_source_sync(source_id, country, last_synced_at, last_status, last_error)
+			VALUES (?1, ?2, ?3, 'error', ?4) ON CONFLICT(source_id, country) DO UPDATE SET
+			last_synced_at = ?3, last_status = 'error', last_error = ?4`).bind(source.id, targetCountry, now, message));
+		await env.DB.batch(statements);
+		return { id: source.id, name: source.name, success: false, error: message };
+	}
+}
+
+async function 同步到期访问PROXYIP数据源(env, { force = false, country = '' } = {}) {
+	await 确保访问数据库(env);
+	const result = country
+		? await env.DB.prepare(`SELECT s.*, y.last_synced_at AS country_last_synced_at
+			FROM proxy_ip_sources s LEFT JOIN proxy_ip_source_sync y ON y.source_id = s.id AND y.country = ?1
+			WHERE s.enabled = 1 ORDER BY s.id`).bind(country).all()
+		: await env.DB.prepare('SELECT * FROM proxy_ip_sources WHERE enabled = 1 ORDER BY id').all();
+	const now = Date.now();
+	const sources = (result.results || []).filter(source => {
+		if (country && source.default_country && source.default_country !== country) return false;
+		const lastSyncedAt = country ? source.country_last_synced_at : source.last_synced_at;
+		return force || !lastSyncedAt || now - Number(lastSyncedAt) >= Math.max(5, Number(source.refresh_minutes || 30)) * 60000;
+	});
+	const summaries = [];
+	for (const source of sources) summaries.push(await 同步单个访问PROXYIP数据源(env, source, country));
+	return summaries;
+}
+
+async function 检测访问PROXYIP池(env, country, limit = 8) {
+	const checkedAt = Date.now();
+	const result = await env.DB.prepare(`SELECT * FROM proxy_ip_pool
+		WHERE country = ?1 AND enabled = 1
+			AND (health_status <> 'healthy' OR last_checked_at IS NULL OR last_checked_at < ?2)
+		ORDER BY CASE health_status WHEN 'unknown' THEN 0 WHEN 'unhealthy' THEN 1 ELSE 2 END, RANDOM()
+		LIMIT ?3`).bind(country, checkedAt - 6 * 3600000, Math.min(24, Math.max(1, Number(limit) || 8))).all();
+	const candidates = result.results || [];
+	let success = 0, failed = 0, unavailable = 0, cursor = 0;
+	const worker = async () => {
+		while (cursor < candidates.length) {
+			const candidate = candidates[cursor++];
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), 8000);
+			try {
+				const endpoint = String(candidate.proxy_ip).replace(/:443$/, '');
+				const response = await fetch(访问PROXYIP检测URL + encodeURIComponent(endpoint), { signal: controller.signal, headers: { Accept: 'application/json' } });
+				if (!response.ok) throw new Error(`检测服务 HTTP ${response.status}`);
+				const data = await response.json();
+				if (data.success) {
+					success++;
+					await env.DB.prepare(`UPDATE proxy_ip_pool SET health_status = 'healthy', latency_ms = ?1,
+						failure_count = 0, last_checked_at = ?2, last_success_at = ?2, last_error = '' WHERE id = ?3`)
+						.bind(Math.max(0, Math.round(Number(data.responseTime) || 0)), checkedAt, candidate.id).run();
+				} else {
+					failed++;
+					await env.DB.prepare(`UPDATE proxy_ip_pool SET health_status = 'unhealthy', latency_ms = NULL,
+						failure_count = failure_count + 1, last_checked_at = ?1, last_error = 'PROXYIP 检测失败' WHERE id = ?2`)
+						.bind(checkedAt, candidate.id).run();
+				}
+			} catch (error) {
+				unavailable++;
+				await env.DB.prepare(`UPDATE proxy_ip_pool SET last_checked_at = ?1, last_error = ?2 WHERE id = ?3`)
+					.bind(checkedAt, String(error?.message || error).slice(0, 200), candidate.id).run();
+			} finally { clearTimeout(timer); }
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(4, candidates.length) }, worker));
+	return { checked: candidates.length, success, failed, unavailable };
 }
 
 function 格式化后台访问记录(记录, config, origin) {
@@ -808,22 +1164,31 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 		if (pathname === '/admin/access/api/state' && request.method === 'GET') {
 			const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
 			const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
-			const [链接结果, IP结果, 统计结果] = await Promise.all([
+			const [链接结果, IP结果, 统计结果, 数据源结果, 国家池结果] = await Promise.all([
 				session.prepare('SELECT * FROM access_links ORDER BY id DESC LIMIT ?1 OFFSET ?2').bind(limit, offset).all(),
-				session.prepare('SELECT * FROM proxy_ip_pool ORDER BY country, id DESC').all(),
+				session.prepare(`SELECT p.*, COALESCE(s.name, '手动添加') AS source_name FROM proxy_ip_pool p
+					LEFT JOIN proxy_ip_sources s ON s.id = p.source_id ORDER BY p.country, p.id DESC LIMIT 500`).all(),
 				session.prepare(`SELECT COUNT(*) AS total,
 					SUM(CASE WHEN status = 'active' AND first_used_at IS NULL THEN 1 ELSE 0 END) AS unused,
 					SUM(CASE WHEN status = 'active' AND first_used_at IS NOT NULL AND (expires_at IS NULL OR expires_at > ?1) THEN 1 ELSE 0 END) AS active,
 					SUM(CASE WHEN status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?1 THEN 1 ELSE 0 END) AS expired,
 					SUM(CASE WHEN status <> 'active' THEN 1 ELSE 0 END) AS revoked
-					FROM access_links`).bind(Date.now()).first()
+					FROM access_links`).bind(Date.now()).first(),
+				session.prepare('SELECT * FROM proxy_ip_sources ORDER BY id').all(),
+				session.prepare(`SELECT country, COUNT(*) AS total,
+					SUM(CASE WHEN enabled = 1 AND health_status <> 'unhealthy' THEN 1 ELSE 0 END) AS available,
+					SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
+					SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
+					FROM proxy_ip_pool GROUP BY country ORDER BY country`).all()
 			]);
 			const 基础配置 = await 读取config_JSON(env, host, userID, UA);
 			return 访问JSON响应({
 				success: true,
 				stats: 统计结果 || { total: 0, unused: 0, active: 0, expired: 0, revoked: 0 },
 				links: (链接结果.results || []).map(item => 格式化后台访问记录(item, 基础配置, url.origin)),
-				pools: IP结果.results || []
+				pools: IP结果.results || [],
+				sources: 数据源结果.results || [],
+				poolStats: 国家池结果.results || []
 			});
 		}
 
@@ -841,6 +1206,19 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			const note = String(body.note || '').trim().slice(0, 100);
 			if (!isPermanent && (!Number.isInteger(durationHours) || durationHours < 1 || durationHours > 8760)) throw new Error('有效时长必须是 1 到 8760 的整数小时，或选择永久');
 			if (!Number.isInteger(count) || count < 1 || count > 100) throw new Error('单次生成数量必须是 1 到 100');
+			await 同步到期访问PROXYIP数据源(env, { country });
+			let poolState = await session.prepare(`SELECT
+				SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
+				SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
+				FROM proxy_ip_pool WHERE country = ?1`).bind(country).first();
+			if (!Number(poolState?.healthy) && Number(poolState?.unknown)) {
+				await 检测访问PROXYIP池(env, country, 8);
+				poolState = await session.prepare(`SELECT
+					SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
+					SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
+					FROM proxy_ip_pool WHERE country = ?1`).bind(country).first();
+			}
+			if (!Number(poolState?.healthy) && !Number(poolState?.unknown)) throw new Error(`${country} 暂无可用 PROXYIP，请同步数据源或稍后重试`);
 			const durationSeconds = isPermanent ? 0 : durationHours * 3600;
 			const createdAt = Date.now();
 			const records = Array.from({ length: count }, (_, index) => ({
@@ -856,7 +1234,7 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 				.bind(record.token, record.uuid, record.country, record.duration_seconds, record.note, createdAt)));
 			const 基础配置 = await 读取config_JSON(env, host, userID, UA);
 			const created = records.map((record, index) => 格式化后台访问记录({ id: null, ...record, proxy_ip: null, status: 'active', created_at: createdAt, first_used_at: null, expires_at: null, last_used_at: null }, 基础配置, url.origin));
-			return 访问JSON响应({ success: true, message: `已生成 ${count} 条访问链接，尚未分配 PROXYIP`, links: created }, 201);
+			return 访问JSON响应({ success: true, message: `已生成 ${count} 条访问链接，${country} 池可用 ${Number(poolState?.healthy) + Number(poolState?.unknown)} 个 PROXYIP`, links: created }, 201);
 		}
 
 		if (pathname === '/admin/access/api/links/action') {
@@ -878,8 +1256,8 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			const proxies = [...new Set(rawList.filter(Boolean).map(标准化访问PROXYIP))];
 			if (!proxies.length || proxies.length > 100) throw new Error('请提供 1 到 100 个 PROXYIP');
 			const createdAt = Date.now();
-			await env.DB.batch(proxies.map(proxy => env.DB.prepare(`INSERT INTO proxy_ip_pool(country, proxy_ip, enabled, created_at)
-				VALUES (?1, ?2, 1, ?3) ON CONFLICT(country, proxy_ip) DO UPDATE SET enabled = 1`)
+			await env.DB.batch(proxies.map(proxy => env.DB.prepare(`INSERT INTO proxy_ip_pool(country, proxy_ip, enabled, created_at, health_status, updated_at)
+				VALUES (?1, ?2, 1, ?3, 'unknown', ?3) ON CONFLICT(country, proxy_ip) DO UPDATE SET enabled = 1, updated_at = ?3`)
 				.bind(country, proxy, createdAt)));
 			return 访问JSON响应({ success: true, message: `已向 ${country} IP 池加入 ${proxies.length} 个地址` }, 201);
 		}
@@ -895,6 +1273,57 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			return 访问JSON响应({ success: true, message: '操作成功' });
 		}
 
+		if (pathname === '/admin/access/api/pools/sync') {
+			const country = 标准化访问国家(body.country);
+			const summaries = await 同步到期访问PROXYIP数据源(env, { force: true, country });
+			const imported = summaries.reduce((sum, item) => sum + Number(item.imported || 0), 0);
+			if (!imported) throw new Error(summaries.find(item => item.error)?.error || `${country} 数据源暂无可用记录`);
+			const health = await 检测访问PROXYIP池(env, country, 8);
+			return 访问JSON响应({ success: true, message: `${country} 已同步 ${imported} 个候选，检测通过 ${health.success} 个`, summaries, health });
+		}
+
+		if (pathname === '/admin/access/api/pools/check') {
+			const country = 标准化访问国家(body.country);
+			const health = await 检测访问PROXYIP池(env, country, body.limit || 8);
+			return 访问JSON响应({ success: true, message: `${country} 检测完成：可用 ${health.success}，失败 ${health.failed}，检测服务异常 ${health.unavailable}`, health });
+		}
+
+		if (pathname === '/admin/access/api/sources') {
+			const name = String(body.name || '').trim().slice(0, 80);
+			const sourceUrl = 标准化访问数据源URL(body.url);
+			const defaultCountry = body.defaultCountry ? 标准化访问国家(body.defaultCountry) : '';
+			const refreshMinutes = Math.min(1440, Math.max(5, Math.floor(Number(body.refreshMinutes) || 60)));
+			const maxPerCountry = Math.min(200, Math.max(10, Math.floor(Number(body.maxPerCountry) || 100)));
+			if (!name) throw new Error('请输入数据源名称');
+			const now = Date.now();
+			await session.prepare(`INSERT INTO proxy_ip_sources
+				(name, url, default_country, enabled, refresh_minutes, max_per_country, last_status, created_at, updated_at)
+				VALUES (?1, ?2, ?3, 1, ?4, ?5, 'never', ?6, ?6)
+				ON CONFLICT(url) DO UPDATE SET name = ?1, default_country = ?3, enabled = 1,
+				refresh_minutes = ?4, max_per_country = ?5, updated_at = ?6`)
+				.bind(name, sourceUrl, defaultCountry, refreshMinutes, maxPerCountry, now).run();
+			return 访问JSON响应({ success: true, message: '数据源已保存；选择国家后点击同步即可导入' }, 201);
+		}
+
+		if (pathname === '/admin/access/api/sources/action') {
+			const id = Math.floor(Number(body.id));
+			const action = String(body.action || '');
+			if (!Number.isInteger(id) || id < 1) throw new Error('数据源 ID 无效');
+			const source = await session.prepare('SELECT * FROM proxy_ip_sources WHERE id = ?1').bind(id).first();
+			if (!source) throw new Error('数据源不存在');
+			if (action === 'enable') await session.prepare('UPDATE proxy_ip_sources SET enabled = 1, updated_at = ?1 WHERE id = ?2').bind(Date.now(), id).run();
+			else if (action === 'disable') await session.prepare('UPDATE proxy_ip_sources SET enabled = 0, updated_at = ?1 WHERE id = ?2').bind(Date.now(), id).run();
+			else if (action === 'delete') {
+				if (source.url === 内置访问PROXYIP数据源URL) throw new Error('内置数据源不能删除，可以停用');
+				await env.DB.batch([
+					session.prepare('DELETE FROM proxy_ip_pool WHERE source_id = ?1').bind(id),
+					session.prepare('DELETE FROM proxy_ip_source_sync WHERE source_id = ?1').bind(id),
+					session.prepare('DELETE FROM proxy_ip_sources WHERE id = ?1').bind(id)
+				]);
+			} else throw new Error('不支持的数据源操作');
+			return 访问JSON响应({ success: true, message: '数据源操作成功' });
+		}
+
 		return 访问错误响应('管理接口不存在', 404);
 	} catch (error) {
 		console.error('访问链接管理失败:', error);
@@ -907,13 +1336,14 @@ function 访问链接管理页面() {
 	const html = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>限时访问链接</title><style>
-:root{color-scheme:dark;--bg:#09111f;--panel:#111c2e;--line:#263550;--text:#e8eef9;--muted:#91a0b9;--blue:#4f8cff;--red:#ff6078;--green:#39d98a}*{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#07101d,#0d1830);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1440px;margin:auto;padding:24px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px}.top a{color:#9ec0ff}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:20px 0}.card{background:rgba(17,28,46,.94);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 14px 40px #0003}h1,h2{margin:0 0 14px}label{display:block;color:var(--muted);margin:9px 0 5px}input,textarea,select,button{font:inherit}input,textarea,select{width:100%;background:#091425;color:var(--text);border:1px solid #344563;border-radius:8px;padding:10px}textarea{min-height:110px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}button{border:0;border-radius:8px;padding:9px 12px;background:var(--blue);color:white;cursor:pointer}button.alt{background:#344563}button.danger{background:#8b3040}button.small{padding:5px 8px;font-size:12px;margin:2px}.msg{min-height:22px;margin-top:10px;color:var(--green)}.stats{display:flex;gap:9px;flex-wrap:wrap;margin:16px 0}.pill{background:#16243a;border:1px solid var(--line);padding:7px 11px;border-radius:999px}.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:10px}table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #22314a;vertical-align:top}th{color:#aebbd0;background:#142138;position:sticky;top:0}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.unused{color:#f6c85f}.active{color:var(--green)}.expired,.revoked{color:var(--red)}.muted{color:var(--muted)}@media(max-width:800px){.grid{grid-template-columns:1fr}.row{grid-template-columns:1fr}.wrap{padding:14px}}
+:root{color-scheme:dark;--bg:#09111f;--panel:#111c2e;--line:#263550;--text:#e8eef9;--muted:#91a0b9;--blue:#4f8cff;--red:#ff6078;--green:#39d98a}*{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#07101d,#0d1830);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1440px;margin:auto;padding:24px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px}.top a{color:#9ec0ff}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:20px 0}.card{background:rgba(17,28,46,.94);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 14px 40px #0003}h1,h2,h3{margin:0 0 14px}h3{font-size:15px}label{display:block;color:var(--muted);margin:9px 0 5px}input,textarea,select,button{font:inherit}input,textarea,select{width:100%;background:#091425;color:var(--text);border:1px solid #344563;border-radius:8px;padding:10px}textarea{min-height:90px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.row.three{grid-template-columns:2fr 1fr 1fr}button{border:0;border-radius:8px;padding:9px 12px;background:var(--blue);color:white;cursor:pointer}button.alt{background:#344563}button.danger{background:#8b3040}button.small{padding:5px 8px;font-size:12px;margin:2px}.msg{min-height:22px;margin-top:10px;color:var(--green)}.stats{display:flex;gap:9px;flex-wrap:wrap;margin:16px 0}.pill{background:#16243a;border:1px solid var(--line);padding:7px 11px;border-radius:999px}.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:10px}table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #22314a;vertical-align:top}th{color:#aebbd0;background:#142138;position:sticky;top:0}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.unused,.unknown{color:#f6c85f}.active,.healthy{color:var(--green)}.expired,.revoked,.unhealthy{color:var(--red)}.muted{color:var(--muted)}details{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}summary{cursor:pointer;color:#aebbd0;font-weight:600;margin-bottom:10px}.notice{background:#0b2630;border:1px solid #175064;border-radius:9px;padding:10px 12px;color:#9addeb;margin-bottom:12px}@media(max-width:800px){.grid{grid-template-columns:1fr}.row,.row.three{grid-template-columns:1fr}.wrap{padding:14px}}
 </style></head><body><main class="wrap"><div class="top"><div><h1>限时访问链接</h1><div class="muted">首次真实代理连接才分配 PROXYIP 并开始计时</div></div><a href="/admin">返回原后台</a></div>
-<div class="stats" id="stats"></div><section class="grid"><form class="card" id="createForm"><h2>生成访问链接</h2><div class="row"><div><label>国家代码或名称</label><input name="country" list="countryOptions" placeholder="输入名称或代码搜索" autocomplete="off" required></div><div><label>有效时长（小时）</label><input name="durationHours" list="durationOptions" value="3" inputmode="numeric" placeholder="输入整数小时或选择永久" autocomplete="off" required></div></div><div class="row"><div><label>生成数量（单次最多 100）</label><input name="count" type="number" min="1" max="100" value="1" required></div><div><label>备注</label><input name="note" maxlength="100" placeholder="可留空"></div></div><p><button type="submit">生成链接</button></p><div class="msg" id="createMsg"></div></form>
-<form class="card" id="poolForm"><h2>维护国家 PROXYIP 池</h2><label>国家代码或名称</label><input name="country" list="countryOptions" placeholder="输入名称或代码搜索" autocomplete="off" required><label>PROXYIP（每行或逗号分隔）</label><textarea name="proxyIps" placeholder="38.54.59.70\nproxy.example.com:443" required></textarea><button type="submit">加入 IP 池</button><div class="msg" id="poolMsg"></div></form></section>
+<div class="stats" id="stats"></div><section class="grid"><form class="card" id="createForm"><h2>生成访问链接</h2><div class="notice">选择国家后会自动从内置列表同步并检测 PROXYIP，不需要手动维护。</div><div class="row"><div><label>国家代码或名称</label><input name="country" list="countryOptions" placeholder="输入名称或代码搜索" autocomplete="off" required></div><div><label>有效时长（小时）</label><input name="durationHours" list="durationOptions" value="3" inputmode="numeric" placeholder="输入整数小时或选择永久" autocomplete="off" required></div></div><div class="row"><div><label>生成数量（单次最多 100）</label><input name="count" type="number" min="1" max="100" value="1" required></div><div><label>备注</label><input name="note" maxlength="100" placeholder="可留空"></div></div><p><button type="submit">生成链接</button></p><div class="msg" id="createMsg"></div></form>
+<div class="card"><h2>自动 PROXYIP 池</h2><div class="notice">已内置 CM科技大学 ProxyIP 列表；每个国家按需缓存最多 100 个候选，并自动检测。</div><form id="syncForm"><label>要同步的国家</label><input name="country" list="countryOptions" placeholder="例如 VN / 越南" autocomplete="off" required><p><button type="submit">立即同步并检测</button></p><div class="msg" id="syncMsg"></div></form><details><summary>手动补充 PROXYIP</summary><form id="poolForm"><label>国家代码或名称</label><input name="country" list="countryOptions" placeholder="输入名称或代码搜索" autocomplete="off" required><label>PROXYIP（每行或逗号分隔）</label><textarea name="proxyIps" placeholder="38.54.59.70\nproxy.example.com:443" required></textarea><button type="submit">加入 IP 池</button><div class="msg" id="poolMsg"></div></form></details><details><summary>添加其他数据源（可选）</summary><form id="sourceForm"><label>名称</label><input name="name" maxlength="80" placeholder="我的 GitHub 列表" required><label>HTTPS / GitHub Raw / API 地址</label><input name="url" type="url" placeholder="https://..." required><div class="row three"><div><label>纯 IP 列表的默认国家（多国 JSON 留空）</label><input name="defaultCountry" list="countryOptions" placeholder="可留空"></div><div><label>刷新（分钟）</label><input name="refreshMinutes" type="number" min="5" max="1440" value="60"></div><div><label>每国上限</label><input name="maxPerCountry" type="number" min="10" max="200" value="100"></div></div><p><button type="submit">保存数据源</button></p><div class="msg" id="sourceMsg"></div></form></details></div></section>
 <datalist id="countryOptions">${国家选项HTML}</datalist><datalist id="durationOptions"><option value="1">1 小时</option><option value="3">3 小时</option><option value="5">5 小时</option><option value="8">8 小时</option><option value="12">12 小时</option><option value="24">24 小时</option><option value="48">48 小时</option><option value="72">72 小时</option><option value="permanent">永久</option></datalist>
 <section class="card"><h2>访问链接</h2><div class="tablewrap"><table><thead><tr><th>ID / 备注</th><th>国家</th><th>状态</th><th>时长</th><th>PROXYIP</th><th>首次使用 / 到期</th><th>链接</th><th>操作</th></tr></thead><tbody id="links"></tbody></table></div></section>
-<section class="card" style="margin-top:18px"><h2>国家 IP 池</h2><div class="tablewrap"><table style="min-width:700px"><thead><tr><th>ID</th><th>国家</th><th>PROXYIP</th><th>状态</th><th>操作</th></tr></thead><tbody id="pools"></tbody></table></div></section></main>
+<section class="card" style="margin-top:18px"><h2>国家 IP 池</h2><div class="tablewrap"><table style="min-width:700px"><thead><tr><th>国家</th><th>总数</th><th>可用候选</th><th>已检测可用</th><th>操作</th></tr></thead><tbody id="poolStats"></tbody></table></div><details><summary>查看最近 500 条 IP</summary><div class="tablewrap"><table style="min-width:900px"><thead><tr><th>ID</th><th>国家</th><th>PROXYIP</th><th>健康状态</th><th>延迟</th><th>来源</th><th>操作</th></tr></thead><tbody id="pools"></tbody></table></div></details></section>
+<section class="card" style="margin-top:18px"><h2>PROXYIP 数据源</h2><div class="tablewrap"><table style="min-width:850px"><thead><tr><th>名称</th><th>地址</th><th>同步状态</th><th>刷新周期</th><th>操作</th></tr></thead><tbody id="sources"></tbody></table></div></section></main>
 <script>
 const $=s=>document.querySelector(s), esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=v=>v?new Date(Number(v)).toLocaleString():'—';
@@ -921,10 +1351,15 @@ async function api(path,options){const r=await fetch('/admin/access/api/'+path,{
 function button(text,attrs,cls='small alt'){return '<button type="button" class="'+cls+'" '+attrs+'>'+text+'</button>'}
 async function load(){try{const d=await api('state');const s=d.stats||{};$('#stats').innerHTML=['总计 '+(s.total||0),'未使用 '+(s.unused||0),'使用中 '+(s.active||0),'已过期 '+(s.expired||0),'已停用 '+(s.revoked||0)].map(x=>'<span class="pill">'+x+'</span>').join('');
 const names={unused:'未使用',active:'使用中',expired:'已过期',revoked:'已停用'};$('#links').innerHTML=d.links.map(x=>'<tr><td><b>#'+x.id+'</b><br>'+esc(x.note||'—')+'<br><span class="mono muted">'+esc(x.uuid)+'</span></td><td>'+esc(x.country)+'</td><td class="'+x.display_status+'">'+names[x.display_status]+'</td><td>'+esc(x.duration_label)+'</td><td class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'</td><td>'+fmt(x.first_used_at)+'<br>'+(Number(x.duration_seconds)===0?'永久':fmt(x.expires_at))+'</td><td>'+button('复制订阅','data-copy="'+esc(x.subscription_url)+'"')+button('复制节点','data-copy="'+esc(x.node_url)+'"')+'</td><td>'+button(x.status==='active'?'停用':'启用','data-id="'+x.id+'" data-action="'+(x.status==='active'?'revoke':'enable')+'"',x.status==='active'?'small danger':'small')+button('重置计时','data-id="'+x.id+'" data-action="reset"')+button('重选 IP','data-id="'+x.id+'" data-action="reassign"')+button('删除','data-id="'+x.id+'" data-action="delete"','small danger')+'</td></tr>').join('')||'<tr><td colspan="8" class="muted">暂无链接</td></tr>';
-$('#pools').innerHTML=d.pools.map(x=>'<tr><td>#'+x.id+'</td><td>'+esc(x.country)+'</td><td class="mono">'+esc(x.proxy_ip)+'</td><td>'+(x.enabled?'启用':'停用')+'</td><td>'+button(x.enabled?'停用':'启用','data-pool-id="'+x.id+'" data-pool-action="'+(x.enabled?'disable':'enable')+'"')+button('删除','data-pool-id="'+x.id+'" data-pool-action="delete"','small danger')+'</td></tr>').join('')||'<tr><td colspan="5" class="muted">暂无 PROXYIP，请先添加</td></tr>';}catch(e){alert(e.message)}}
-$('#createForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.target);try{const d=await api('links',{method:'POST',body:JSON.stringify(Object.fromEntries(f))});$('#createMsg').textContent=d.message;await load()}catch(err){$('#createMsg').textContent=err.message}});
+const healthNames={unknown:'待检测',healthy:'可用',unhealthy:'不可用'};
+$('#poolStats').innerHTML=(d.poolStats||[]).map(x=>'<tr><td><b>'+esc(x.country)+'</b></td><td>'+Number(x.total||0)+'</td><td>'+Number(x.available||0)+'</td><td class="healthy">'+Number(x.healthy||0)+'</td><td>'+button('同步','data-sync-country="'+esc(x.country)+'"')+button('检测 8 个','data-check-country="'+esc(x.country)+'"')+'</td></tr>').join('')||'<tr><td colspan="5" class="muted">选择国家生成链接时会自动创建 IP 池</td></tr>';
+$('#pools').innerHTML=d.pools.map(x=>'<tr><td>#'+x.id+'</td><td>'+esc(x.country)+'</td><td class="mono">'+esc(x.proxy_ip)+'</td><td class="'+esc(x.health_status||'unknown')+'">'+(x.enabled?(healthNames[x.health_status]||'待检测'):'已停用')+'</td><td>'+(x.latency_ms==null?'—':Number(x.latency_ms)+' ms')+'</td><td>'+esc(x.source_name||'手动添加')+'</td><td>'+button(x.enabled?'停用':'启用','data-pool-id="'+x.id+'" data-pool-action="'+(x.enabled?'disable':'enable')+'"')+button('删除','data-pool-id="'+x.id+'" data-pool-action="delete"','small danger')+'</td></tr>').join('')||'<tr><td colspan="7" class="muted">暂无 PROXYIP；生成链接时会自动同步</td></tr>';
+$('#sources').innerHTML=(d.sources||[]).map(x=>'<tr><td><b>'+esc(x.name)+'</b><br><span class="muted">'+(x.default_country?'默认 '+esc(x.default_country):'多国家数据')+'</span></td><td><span class="mono" title="'+esc(x.url)+'">'+esc(x.url.length>70?x.url.slice(0,70)+'…':x.url)+'</span></td><td class="'+(x.last_status==='error'?'unhealthy':x.last_status==='success'?'healthy':'unknown')+'">'+(x.last_status==='success'?'同步成功':x.last_status==='error'?'同步失败：'+esc(x.last_error):'尚未同步')+'<br><span class="muted">'+fmt(x.last_synced_at)+'</span></td><td>'+Number(x.refresh_minutes)+' 分钟<br>每国 '+Number(x.max_per_country)+'</td><td>'+button(x.enabled?'停用':'启用','data-source-id="'+x.id+'" data-source-action="'+(x.enabled?'disable':'enable')+'"')+(x.url.includes('zip.cm.edu.kg.cmliussss.net')?'':button('删除','data-source-id="'+x.id+'" data-source-action="delete"','small danger'))+'</td></tr>').join('')||'<tr><td colspan="5" class="muted">暂无数据源</td></tr>';}catch(e){alert(e.message)}}
+$('#createForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.target),b=e.submitter;b.disabled=true;$('#createMsg').textContent='正在同步并检测该国家的 PROXYIP…';try{const d=await api('links',{method:'POST',body:JSON.stringify(Object.fromEntries(f))});$('#createMsg').textContent=d.message;await load()}catch(err){$('#createMsg').textContent=err.message}finally{b.disabled=false}});
+$('#syncForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.target),b=e.submitter;b.disabled=true;$('#syncMsg').textContent='正在下载列表并检测，请稍候…';try{const d=await api('pools/sync',{method:'POST',body:JSON.stringify(Object.fromEntries(f))});$('#syncMsg').textContent=d.message;await load()}catch(err){$('#syncMsg').textContent=err.message}finally{b.disabled=false}});
 $('#poolForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.target);try{const d=await api('pools',{method:'POST',body:JSON.stringify(Object.fromEntries(f))});$('#poolMsg').textContent=d.message;await load()}catch(err){$('#poolMsg').textContent=err.message}});
-document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;if(b.dataset.copy){await navigator.clipboard.writeText(b.dataset.copy);b.textContent='已复制';setTimeout(()=>b.textContent=b.dataset.copy.includes('/sub?')?'复制订阅':'复制节点',900);return}try{if(b.dataset.action){if((b.dataset.action==='delete'||b.dataset.action==='reset')&&!confirm('确定执行此操作？'))return;await api('links/action',{method:'POST',body:JSON.stringify({id:Number(b.dataset.id),action:b.dataset.action})});await load()}else if(b.dataset.poolAction){await api('pools/action',{method:'POST',body:JSON.stringify({id:Number(b.dataset.poolId),action:b.dataset.poolAction})});await load()}}catch(err){alert(err.message)}});load();
+$('#sourceForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.target);try{const d=await api('sources',{method:'POST',body:JSON.stringify(Object.fromEntries(f))});$('#sourceMsg').textContent=d.message;e.target.reset();await load()}catch(err){$('#sourceMsg').textContent=err.message}});
+document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;if(b.dataset.copy){await navigator.clipboard.writeText(b.dataset.copy);b.textContent='已复制';setTimeout(()=>b.textContent=b.dataset.copy.includes('/sub?')?'复制订阅':'复制节点',900);return}try{b.disabled=true;if(b.dataset.action){if((b.dataset.action==='delete'||b.dataset.action==='reset')&&!confirm('确定执行此操作？'))return;await api('links/action',{method:'POST',body:JSON.stringify({id:Number(b.dataset.id),action:b.dataset.action})})}else if(b.dataset.poolAction){await api('pools/action',{method:'POST',body:JSON.stringify({id:Number(b.dataset.poolId),action:b.dataset.poolAction})})}else if(b.dataset.syncCountry){const d=await api('pools/sync',{method:'POST',body:JSON.stringify({country:b.dataset.syncCountry})});alert(d.message)}else if(b.dataset.checkCountry){const d=await api('pools/check',{method:'POST',body:JSON.stringify({country:b.dataset.checkCountry,limit:8})});alert(d.message)}else if(b.dataset.sourceAction){if(b.dataset.sourceAction==='delete'&&!confirm('确定删除该数据源及其导入的 IP？'))return;await api('sources/action',{method:'POST',body:JSON.stringify({id:Number(b.dataset.sourceId),action:b.dataset.sourceAction})})}else return;await load()}catch(err){alert(err.message)}finally{b.disabled=false}});load();
 </script></body></html>`;
 	return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" } });
 }
