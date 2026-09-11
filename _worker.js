@@ -308,7 +308,25 @@ export default {
 					}
 
 					ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
-					return fetch(Pages静态页面 + '/admin' + url.search);
+					const 原后台响应 = await fetch(Pages静态页面 + '/admin' + url.search);
+					const 后台内容类型 = 原后台响应.headers.get('Content-Type') || '';
+					if (!后台内容类型.toLowerCase().includes('text/html')) return 原后台响应;
+					const 原后台HTML = await 原后台响应.text();
+					const 国家IP池入口 = '<a href="/admin/access" class="btn btn-primary" style="text-decoration:none;display:inline-block">🔐 国家 IP 池</a>';
+					const 登出按钮 = '<button type="button" class="btn btn-primary" onclick="logout()">👋退出登录</button>';
+					let 后台HTML = 原后台HTML;
+					if (!后台HTML.includes('href="/admin/access"')) {
+						后台HTML = 后台HTML.includes(登出按钮)
+							? 后台HTML.replace(登出按钮, 国家IP池入口 + 登出按钮)
+							: 后台HTML.replace(/<\/body>/i, 国家IP池入口 + '</body>');
+					}
+					const 后台响应头 = new Headers(原后台响应.headers);
+					// 修改 HTML 后移除与原始内容不匹配的缓存/实体头。
+					['Content-Length', 'Content-Encoding', 'ETag', 'Last-Modified', 'Content-MD5'].forEach(name => 后台响应头.delete(name));
+					后台响应头.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+					后台响应头.set('Pragma', 'no-cache');
+					后台响应头.set('Expires', '0');
+					return new Response(后台HTML, { status: 原后台响应.status, statusText: 原后台响应.statusText, headers: 后台响应头 });
 				} else if (访问路径 === 'logout' || uuidRegex.test(访问路径)) {//清除cookie并跳转到登录页面
 					const 响应 = new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
 					响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
