@@ -107,6 +107,7 @@ export default {
 			if (访问路径 === 'admin' || 访问路径.startsWith('admin/') || 访问路径 === 'locations') {
 				管理员会话 = await 验证管理员会话(request, env);
 				if (!管理员会话) return new Response('重定向中...', { status: 302, headers: { 'Location': '/login', 'Cache-Control': 'no-store' } });
+				if (访问路径 === 'admin' && !(env.KV && typeof env.KV.get === 'function') && env.DB && typeof env.DB.prepare === 'function') return Response.redirect(`${url.origin}/admin/access`, 302);
 			}
 			if ((env.KV && typeof env.KV.get === 'function') || (访问路径 === 'sub' && 访问授权上下文)) {
 				const 区分大小写访问路径 = url.pathname.slice(1);
@@ -313,7 +314,7 @@ export default {
 					const 原后台HTML = await 原后台响应.text();
 					const 国家IP池入口 = '<a href="/admin/access" class="btn btn-primary" style="text-decoration:none;display:inline-block">🔐 国家 IP 池</a>';
 					const 登出按钮 = '<button type="button" class="btn btn-primary" onclick="logout()">👋退出登录</button>';
-					let 后台HTML = 原后台HTML;
+					let 后台HTML = 原后台HTML.replace(/fetch\(\s*['"]\/admin\/init['"]\s*\)/g, "fetch('/admin/init',{method:'POST'})");
 					if (!后台HTML.includes('href="/admin/access"')) {
 						后台HTML = 后台HTML.includes(登出按钮)
 							? 后台HTML.replace(登出按钮, 国家IP池入口 + 登出按钮)
@@ -721,7 +722,7 @@ async function 验证管理员修改请求(request, env, url, session, requireCs
 }
 
 function 管理员登录页面() {
-	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理员登录</title><style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#09111f;color:#e8eef9;font:15px system-ui}.box{width:min(92vw,390px);padding:26px;background:#111c2e;border:1px solid #2a3b59;border-radius:16px;box-shadow:0 20px 60px #0006}h1{font-size:22px;margin:0 0 18px}label{display:block;color:#a7b3c8;margin-bottom:6px}input,button{width:100%;font:inherit;border-radius:9px;padding:11px}input{background:#091425;color:#fff;border:1px solid #405273}button{margin-top:14px;border:0;background:#4f8cff;color:#fff;cursor:pointer}.msg{min-height:24px;color:#ff91a1;margin-top:10px}</style></head><body><form class="box" id="login"><h1>管理员登录</h1><label for="password">ADMIN 密码</label><input id="password" name="password" type="password" autocomplete="current-password" required autofocus><button>登录</button><div class="msg" id="msg" role="alert"></div></form><script>document.querySelector('#login').addEventListener('submit',async e=>{e.preventDefault();const b=e.submitter,m=document.querySelector('#msg');b.disabled=true;m.textContent='';try{const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(e.target))});const j=await r.json().catch(()=>({success:false}));if(!r.ok||!j.success)throw new Error(j.error||'登录失败，请稍后重试');location.href='/admin'}catch(x){m.textContent=x.message}finally{b.disabled=false}})</script></body></html>`;
+	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理员登录</title><style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#09111f;color:#e8eef9;font:15px system-ui}.box{width:min(92vw,390px);padding:26px;background:#111c2e;border:1px solid #2a3b59;border-radius:16px;box-shadow:0 20px 60px #0006}h1{font-size:22px;margin:0 0 18px}label{display:block;color:#a7b3c8;margin-bottom:6px}input,button{width:100%;font:inherit;border-radius:9px;padding:11px}input{background:#091425;color:#fff;border:1px solid #405273}button{margin-top:14px;border:0;background:#4f8cff;color:#fff;cursor:pointer}.msg{min-height:24px;color:#ff91a1;margin-top:10px}</style></head><body><form class="box" id="login"><h1>管理员登录</h1><label for="password">ADMIN 密码</label><input id="password" name="password" type="password" autocomplete="current-password" required autofocus><button>登录</button><div class="msg" id="msg" role="alert"></div></form><script>document.querySelector('#login').addEventListener('submit',async e=>{e.preventDefault();const b=e.submitter,m=document.querySelector('#msg');b.disabled=true;m.textContent='';try{const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(e.target))});const j=await r.json().catch(()=>({success:false}));if(!r.ok||!j.success)throw new Error(j.error||'登录失败，请稍后重试');location.href=j.redirect||'/admin'}catch(x){m.textContent=x.message}finally{b.disabled=false}})</script></body></html>`;
 }
 
 async function 读取登录限制(env, ipHash) {
@@ -777,7 +778,7 @@ async function 创建管理员会话(env, request) {
 
 async function 处理管理员登录请求(request, env, url, adminPassword) {
 	if (request.method === 'GET' || request.method === 'HEAD') {
-		if (await 验证管理员会话(request, env)) return Response.redirect(`${url.origin}/admin`, 302);
+		if (await 验证管理员会话(request, env)) return Response.redirect(`${url.origin}/${env.DB && !(env.KV && typeof env.KV.get === 'function') ? 'admin/access' : 'admin'}`, 302);
 		return new Response(request.method === 'HEAD' ? null : 管理员登录页面(), { status: 200, headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'", 'Referrer-Policy': 'no-referrer' } });
 	}
 	if (request.method !== 'POST') return 访问错误响应('不支持的请求方法', 405);
@@ -808,7 +809,7 @@ async function 处理管理员登录请求(request, env, url, adminPassword) {
 	const created = await 创建管理员会话(env, request);
 	await 写入登录限制(env, ipHash, { window_started_at: now, failure_count: 0, blocked_until: null, last_attempt_at: now });
 	await 写入审计日志(env, request, created.record, 'admin.login.success', 'admin_session', created.record.id, null, { expires_at: created.record.expires_at }, true);
-	const response = 访问JSON响应({ success: true });
+	const response = 访问JSON响应({ success: true, redirect: env.DB && !(env.KV && typeof env.KV.get === 'function') ? '/admin/access' : '/admin' });
 	response.headers.append('Set-Cookie', `admin_session=${encodeURIComponent(created.token)}; Path=/; Max-Age=${created.ttlSeconds}; HttpOnly; Secure; SameSite=Strict`);
 	response.headers.append('Set-Cookie', `admin_csrf=${encodeURIComponent(created.csrf)}; Path=/; Max-Age=${created.ttlSeconds}; Secure; SameSite=Strict`);
 	response.headers.append('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict');
@@ -892,7 +893,9 @@ async function 确保访问数据库(env) {
 					last_status TEXT NOT NULL DEFAULT 'never',
 					last_error TEXT NOT NULL DEFAULT '',
 					created_at INTEGER NOT NULL,
-					updated_at INTEGER NOT NULL
+					updated_at INTEGER NOT NULL,
+					sync_lock TEXT,
+					sync_lock_expires_at INTEGER
 				)`),
 				env.DB.prepare(`CREATE TABLE IF NOT EXISTS proxy_ip_source_sync (
 					source_id INTEGER NOT NULL,
@@ -966,7 +969,11 @@ async function 确保访问数据库(env) {
 				['real_failure_count', 'INTEGER NOT NULL DEFAULT 0'],
 				['last_real_failure', 'INTEGER']
 			]);
-			await 补充缺失列('proxy_ip_sources', [['consecutive_failures', 'INTEGER NOT NULL DEFAULT 0']]);
+			await 补充缺失列('proxy_ip_sources', [
+				['consecutive_failures', 'INTEGER NOT NULL DEFAULT 0'],
+				['sync_lock', 'TEXT'],
+				['sync_lock_expires_at', 'INTEGER']
+			]);
 			await env.DB.batch([
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_source ON proxy_ip_pool(source_id)'),
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_health ON proxy_ip_pool(country, enabled, health_status, failure_count)'),
@@ -1044,7 +1051,7 @@ async function 激活访问授权上下文(上下文) {
 		let 记录 = await session.prepare('SELECT * FROM access_links WHERE token = ?1 LIMIT 1').bind(上下文.记录.token).first();
 		if (记录) {
 			const now = Date.now();
-			await 上下文.env.DB.batch([
+			await session.batch([
 				session.prepare('DELETE FROM access_connection_leases WHERE access_link_id = ?1 AND expires_at <= ?2').bind(记录.id, now),
 				session.prepare(`UPDATE access_links SET active_connections = (
 					SELECT COUNT(*) FROM access_connection_leases WHERE access_link_id = ?1
@@ -1068,7 +1075,7 @@ async function 激活访问授权上下文(上下文) {
 
 		const now = Date.now(), 原反代IP = 记录.proxy_ip || null, leaseExpiresAt = now + 90000;
 		上下文.leaseId = crypto.randomUUID();
-		const [admission, update] = await 上下文.env.DB.batch([
+		const [admission, update] = await session.batch([
 			session.prepare(`INSERT INTO access_connection_leases(id, access_link_id, proxy_ip, created_at, heartbeat_at, expires_at)
 				SELECT ?1, id, ?2, ?3, ?3, ?4 FROM access_links
 				WHERE token = ?5 AND status = 'active' AND (expires_at IS NULL OR expires_at > ?3)
@@ -1111,7 +1118,7 @@ async function 激活访问授权上下文(上下文) {
 				VALUES (?1, ?2, ?3)`).bind(记录.id, 记录.proxy_ip, now).run();
 			上下文.eventId = event?.meta?.last_row_id || null;
 		} catch (error) {
-			await 上下文.env.DB.batch([
+			await session.batch([
 				session.prepare('DELETE FROM access_connection_leases WHERE id = ?1').bind(上下文.leaseId),
 				session.prepare(`UPDATE access_links SET active_connections = (
 					SELECT COUNT(*) FROM access_connection_leases WHERE access_link_id = ?1
@@ -1156,7 +1163,7 @@ async function 结束访问授权上下文(上下文, success = null, errorCode 
 			];
 			if (上下文.eventId) statements.push(session.prepare(`UPDATE access_connection_events SET ended_at = ?1, success = ?2, error_code = ?3 WHERE id = ?4`)
 				.bind(now, success == null ? (上下文.代理连接成功 ? 1 : 0) : (success ? 1 : 0), String(errorCode || '').slice(0, 80), 上下文.eventId));
-			await 上下文.env.DB.batch(statements);
+			await session.batch(statements);
 		} catch (error) { console.error('释放访问连接计数失败:', error); }
 	})();
 	return await 上下文.释放任务;
@@ -1509,6 +1516,11 @@ async function 获取访问PROXYIP数据源内容(source, targetCountry = '') {
 
 async function 同步单个访问PROXYIP数据源(env, source, targetCountry = '', 重置健康状态 = false) {
 	const now = Date.now();
+	const lockToken = crypto.randomUUID();
+	const lock = await env.DB.prepare(`UPDATE proxy_ip_sources SET sync_lock = ?1, sync_lock_expires_at = ?2
+		WHERE id = ?3 AND (sync_lock IS NULL OR sync_lock_expires_at <= ?4)`)
+		.bind(lockToken, now + 15 * 60 * 1000, source.id, now).run();
+	if (!Number(lock?.meta?.changes || 0)) return { id: source.id, name: source.name, success: false, error: '数据源正在同步，请稍后重试' };
 	try {
 		const text = await 获取访问PROXYIP数据源内容(source, targetCountry);
 		const parsed = 解析访问PROXYIP数据源(text, targetCountry || source.default_country || '');
@@ -1555,6 +1567,10 @@ async function 同步单个访问PROXYIP数据源(env, source, targetCountry = '
 		await env.DB.batch(statements);
 		if (Number(source.consecutive_failures || 0) + 1 >= 3) await 发送管理通知(env, `source-failure:${source.id}`, 'PROXYIP 数据源连续同步失败', { source_id: source.id, name: source.name, error: message }, 3600);
 		return { id: source.id, name: source.name, success: false, error: message };
+	} finally {
+		try {
+			await env.DB.prepare('UPDATE proxy_ip_sources SET sync_lock = NULL, sync_lock_expires_at = NULL WHERE id = ?1 AND sync_lock = ?2').bind(source.id, lockToken).run();
+		} catch (_) { }
 	}
 }
 
@@ -3051,6 +3067,7 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false;
 	let WS显式队列字节 = 0, WS显式队列条目 = 0;
 	let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
+	let WS首包缓存 = new Uint8Array(0);
 	let ss上下文 = null, ss初始化任务 = null;
 
 	const 释放远端写入器 = () => {
@@ -3346,9 +3363,11 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 		if (判断协议类型 === null) {
 			if (url.searchParams.get('enc')) 判断协议类型 = 'ss';
 			else {
-				当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
-				const bytes = 当前块字节;
-				判断协议类型 = bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a ? '木马' : '魏烈思';
+				WS首包缓存 = 拼接字节数据(WS首包缓存, 数据转Uint8Array(chunk));
+				const 首包解析 = 尝试解析传输首包(WS首包缓存, yourUUID);
+				if (首包解析.状态 === 'need_more' && WS首包缓存.byteLength <= 1024) return;
+				if (首包解析.状态 !== 'ok') throw new Error('Invalid proxy header');
+				判断协议类型 = 首包解析.结果.协议 === 'trojan' ? '木马' : '魏烈思';
 			}
 			判断是否是木马 = 判断协议类型 === '木马';
 			log(`[WS转发] 协议类型: ${判断协议类型} | 来自: ${url.host} | UA: ${request.headers.get('user-agent') || '未知'}`);
@@ -3360,7 +3379,9 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 		}
 		if (await 写入远端(chunk)) return;
 		if (判断协议类型 === '木马') {
-			const 解析结果 = 解析木马请求(chunk, yourUUID);
+			const 首包bytes = WS首包缓存.byteLength ? WS首包缓存 : 数据转Uint8Array(chunk);
+			WS首包缓存 = new Uint8Array(0);
+			const 解析结果 = 解析木马请求(首包bytes, yourUUID);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
 			const { port, hostname, rawClientData, isUDP } = 解析结果;
 			if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
@@ -3376,8 +3397,8 @@ async function 处理WS请求(request, yourUUID, url, 访问授权上下文 = nu
 			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文 || 请求反代上下文);
 		} else {
 			判断是否是木马 = false;
-			当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
-			const bytes = 当前块字节;
+			const bytes = WS首包缓存.byteLength ? WS首包缓存 : (当前块字节 || 数据转Uint8Array(chunk));
+			WS首包缓存 = new Uint8Array(0);
 			const 解析结果 = 解析魏烈思请求(bytes, yourUUID);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
 			const { port, hostname, version, isUDP, rawClientData } = 解析结果;
@@ -4528,11 +4549,12 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 	const writer = socket.writable.getWriter(), reader = socket.readable.getReader();
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
+	const connectHost = targetHost.includes(':') && !targetHost.startsWith('[') ? `[${targetHost}]` : targetHost;
 	try {
 		if (HTTPS代理) await socket.opened;
 
 		const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
-		const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
+		const request = `CONNECT ${connectHost}:${targetPort} HTTP/1.1\r\nHost: ${connectHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
 		await writer.write(encoder.encode(request));
 		writer.releaseLock();
 
@@ -4582,6 +4604,7 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, 代�
 	const { username, password, hostname, port } = 代理地址;
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
+	const connectHost = targetHost.includes(':') && !targetHost.startsWith('[') ? `[${targetHost}]` : targetHost;
 	let tlsSocket = null;
 	const tlsServerName = isIPHostname(hostname) ? '' : stripIPv6Brackets(hostname);
 	const 打开HTTPS代理TLS = async (allowChacha = false) => {
@@ -4607,7 +4630,7 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, 代�
 		}
 
 		const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
-		const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
+		const request = `CONNECT ${connectHost}:${targetPort} HTTP/1.1\r\nHost: ${connectHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
 		await tlsSocket.write(encoder.encode(request));
 
 		let responseBuffer = new Uint8Array(0), headerEndIndex = -1, bytesRead = 0;
