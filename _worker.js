@@ -1,4 +1,4 @@
-﻿const Version = '2026-05-17 18:52:03';
+const Version = '2026-05-17 18:52:03';
 const 访问管理增强版本 = '2026-09-11 00:00:00';
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓存反代数组索引 = 0, 启用反代兜底 = true, 调试日志打印 = false;
@@ -63,7 +63,7 @@ export default {
 			const proxyIPs = await 整理成数组(env.PROXYIP);
 			请求反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
 			请求启用反代兜底 = false;
-		} else 请求反代IP = (request.cf.colo + '.PrOxYIp.CmLiUsSsS.nEt').toLowerCase();
+		} else 请求反代IP = ((request.cf?.colo || 'iad') + '.PrOxYIp.CmLiUsSsS.nEt').toLowerCase();
 		// 旧的订阅生成流程仍读取这两个默认值；实际隧道连接使用下面的请求级快照。
 		反代IP = 请求反代IP;
 		启用反代兜底 = 请求启用反代兜底;
@@ -301,7 +301,7 @@ export default {
 					} else if (区分大小写访问路径 === 'admin/ADD.txt') {// 处理 admin/ADD.txt 请求，返回本地优选IP
 						let 本地优选IP = await env.KV.get('ADD.txt') || 'null';
 						if (本地优选IP == 'null') 本地优选IP = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[1];
-						return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': request.cf.asn } });
+						return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': String(request.cf?.asn || '') } });
 					} else if (访问路径 === 'admin/cf.json') {// CF配置文件
 						return new Response(JSON.stringify(request.cf, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					}
@@ -742,6 +742,26 @@ async function 写入登录限制(env, ipHash, record) {
 	} else if (env.KV && typeof env.KV.put === 'function') await env.KV.put(`admin-login:${ipHash}`, JSON.stringify(record), { expirationTtl: 3600 });
 }
 
+async function 记录管理员登录失败(env, ipHash, attempt, now, windowMs, threshold, blockMs) {
+	if (env.DB && typeof env.DB.prepare === 'function') {
+		// 必须基于写入时的数据库记录累加；并发请求可能读到了相同的旧快照。
+		const resetWindow = '(?2 - window_started_at > ?3 AND COALESCE(blocked_until, 0) <= ?2)';
+		const nextCount = `CASE WHEN ${resetWindow} THEN 1 ELSE failure_count + 1 END`;
+		return await env.DB.prepare(`INSERT INTO admin_login_attempts(ip_hash, window_started_at, failure_count, blocked_until, last_attempt_at)
+			VALUES (?1, ?2, 1, NULL, ?2) ON CONFLICT(ip_hash) DO UPDATE SET
+			window_started_at = CASE WHEN ${resetWindow} THEN ?2 ELSE window_started_at END,
+			failure_count = ${nextCount},
+			blocked_until = CASE WHEN blocked_until > ?2 THEN blocked_until
+				WHEN (${nextCount}) >= ?4 THEN ?2 + ?5 ELSE NULL END,
+			last_attempt_at = ?2 RETURNING *`)
+			.bind(ipHash, now, windowMs, threshold, blockMs).first();
+	}
+	// KV 不提供原子读改写；保留仅绑定 KV 的兼容流程。
+	const record = 计算登录失败状态(attempt, now, threshold, blockMs);
+	await 写入登录限制(env, ipHash, record);
+	return record;
+}
+
 async function 创建管理员会话(env, request) {
 	const token = 生成安全随机值(32), csrf = 生成安全随机值(24), id = crypto.randomUUID();
 	const now = Date.now(), ttlSeconds = Math.min(604800, Math.max(900, Number(env.ADMIN_SESSION_TTL_SECONDS) || 86400));
@@ -781,8 +801,7 @@ async function 处理管理员登录请求(request, env, url, adminPassword) {
 	} catch (_) { }
 	const passwordMatches = adminPassword && inputPassword.length === adminPassword.length && await 安全比较文本(inputPassword, adminPassword);
 	if (!passwordMatches) {
-		attempt = 计算登录失败状态(attempt, now, threshold, blockMs);
-		await 写入登录限制(env, ipHash, attempt);
+		attempt = await 记录管理员登录失败(env, ipHash, attempt, Date.now(), windowMs, threshold, blockMs);
 		await 写入审计日志(env, request, null, 'admin.login.failed', 'admin_session', '', null, { reason: 'invalid_credentials' }, false, '统一认证失败');
 		return 访问错误响应('登录失败，请稍后重试', attempt.blocked_until ? 429 : 401);
 	}
@@ -1036,6 +1055,7 @@ async function 激活访问授权上下文(上下文) {
 		const 读取错误 = 访问限制错误(记录, 上下文.clientIP);
 		if (读取错误) throw Object.assign(new Error(读取错误.message), { status: 读取错误.status });
 		if (记录.uuid !== 请求认证UUID) throw Object.assign(new Error('访问凭据已轮换，请更新节点后重试'), { status: 403 });
+		const linkId = 记录.id, connectionEpoch = Number(记录.connection_epoch || 0);
 
 		let IP结果 = await 查询健康访问代理候选(session, 记录.country, 记录.proxy_ip);
 		if (!(IP结果.results || []).length) {
@@ -1055,8 +1075,8 @@ async function 激活访问授权上下文(上下文) {
 					AND (max_total_connections = 0 OR connection_count < max_total_connections)
 					AND (max_concurrent_connections = 0 OR active_connections < max_concurrent_connections)
 					AND (bind_first_ip = 0 OR bound_ip IS NULL OR bound_ip = ?6)
-					AND uuid = ?7`)
-				.bind(上下文.leaseId, 选定反代IP, now, leaseExpiresAt, 记录.token, 上下文.clientIP || '', 请求认证UUID),
+					AND uuid = ?7 AND connection_epoch = ?8`)
+				.bind(上下文.leaseId, 选定反代IP, now, leaseExpiresAt, 记录.token, 上下文.clientIP || '', 请求认证UUID, connectionEpoch),
 			session.prepare(`UPDATE access_links SET
 			proxy_ip = ?1,
 			first_used_at = COALESCE(first_used_at, ?2),
@@ -1078,8 +1098,15 @@ async function 激活访问授权上下文(上下文) {
 			throw Object.assign(new Error(限制错误.message), { status: 限制错误.status });
 		}
 
-		记录 = await session.prepare('SELECT * FROM access_links WHERE token = ?1 LIMIT 1').bind(记录.token).first();
 		try {
+			// 准入之后可能发生重置；不能把新代次或已删除的租约当成本次授权。
+			记录 = await session.prepare(`SELECT * FROM access_links WHERE id = ?1 AND connection_epoch = ?2
+				AND EXISTS (SELECT 1 FROM access_connection_leases WHERE id = ?3 AND access_link_id = ?1 AND expires_at > ?4)`)
+				.bind(linkId, connectionEpoch, 上下文.leaseId, Date.now()).first();
+			if (!记录) throw Object.assign(new Error('访问链接状态已变化，请重试'), { status: 409 });
+			const 状态错误 = 获取访问记录状态错误(记录);
+			if (状态错误) throw Object.assign(new Error(状态错误.message), { status: 状态错误.status });
+			if (记录.uuid !== 请求认证UUID || 记录.token !== 上下文.记录.token) throw Object.assign(new Error('访问凭据已轮换，请更新节点后重试'), { status: 403 });
 			const event = await session.prepare(`INSERT INTO access_connection_events(access_link_id, proxy_ip, started_at)
 				VALUES (?1, ?2, ?3)`).bind(记录.id, 记录.proxy_ip, now).run();
 			上下文.eventId = event?.meta?.last_row_id || null;
@@ -1088,13 +1115,13 @@ async function 激活访问授权上下文(上下文) {
 				session.prepare('DELETE FROM access_connection_leases WHERE id = ?1').bind(上下文.leaseId),
 				session.prepare(`UPDATE access_links SET active_connections = (
 					SELECT COUNT(*) FROM access_connection_leases WHERE access_link_id = ?1
-				) WHERE id = ?1`).bind(记录.id)
+				) WHERE id = ?1`).bind(linkId)
 			]);
 			throw error;
 		}
 
 		上下文.记录 = 记录;
-		上下文.connectionEpoch = Number(记录.connection_epoch || 0);
+		上下文.connectionEpoch = connectionEpoch;
 		上下文.反代上下文 = {
 			反代IP: [记录.proxy_ip, ...候选反代IP.filter(item => item !== 记录.proxy_ip)].join(','),
 			启用反代兜底: false,
@@ -1138,15 +1165,17 @@ async function 结束访问授权上下文(上下文, success = null, errorCode 
 function 安排访问链接到期(上下文, 关闭函数) {
 	if (!上下文 || typeof 关闭函数 !== 'function') return null;
 	上下文.到期关闭函数 = 关闭函数;
-	if (上下文.监控定时器 || 上下文.已释放) return 上下文.监控定时器;
+	if (上下文.已释放) { 关闭函数(); return null; }
+	if (上下文.监控定时器) return 上下文.监控定时器;
 	const intervalMs = Math.min(60000, Math.max(10000, Number(上下文.env.ACCESS_STATUS_CHECK_SECONDS) * 1000 || 30000));
 	const check = async () => {
 		if (上下文.已释放) return;
 		try {
 			const now = Date.now(), session = 获取访问数据库会话(上下文.env);
-			await session.prepare('UPDATE access_connection_leases SET heartbeat_at = ?1, expires_at = ?2 WHERE id = ?3').bind(now, now + Math.max(90000, intervalMs * 3), 上下文.leaseId).run();
+			const heartbeat = await session.prepare('UPDATE access_connection_leases SET heartbeat_at = ?1, expires_at = ?2 WHERE id = ?3 AND expires_at > ?1').bind(now, now + Math.max(90000, intervalMs * 3), 上下文.leaseId).run();
 			const current = await session.prepare('SELECT status, expires_at, connection_epoch FROM access_links WHERE id = ?1').bind(上下文.记录.id).first();
-			const error = 获取访问记录状态错误(current, now) || (Number(current?.connection_epoch || 0) !== Number(上下文.connectionEpoch || 0) ? { status: 409, message: '访问链接计时已重置' } : null);
+			const error = 获取访问记录状态错误(current, now) || (Number(current?.connection_epoch || 0) !== Number(上下文.connectionEpoch || 0) ? { status: 409, message: '访问链接计时已重置' } : null)
+				|| (!Number(heartbeat?.meta?.changes || 0) ? { status: 409, message: '访问连接租约已失效' } : null);
 			if (error) {
 				try { 上下文.到期关闭函数() } catch (_) { }
 				await 结束访问授权上下文(上下文, false, error.status === 410 ? 'expired' : 'disabled');
@@ -1260,7 +1289,11 @@ function 标准化访问数据源URL(value) {
 	try { url = new URL(String(value || '').trim()); } catch (_) { throw new Error('数据源 URL 格式不正确'); }
 	if (url.protocol !== 'https:' || url.username || url.password || url.href.length > 2000) throw new Error('数据源必须使用不含账号密码的 HTTPS URL');
 	const hostname = url.hostname.toLowerCase();
-	if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') || hostname.endsWith('.internal') || /^127\./.test(hostname) || /^0\./.test(hostname) || /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^169\.254\./.test(hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) || /^100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])\./.test(hostname) || /^198\.(?:1[89])\./.test(hostname) || /^(?:22[4-9]|23\d)\./.test(hostname) || /^(?:\[)?(?:::?\]?$$|::1|f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:|ff[0-9a-f]{2}:|::ffff:(?:127|10|192\.168|169\.254|172\.(?:1[6-9]|2\d|3[01])))/i.test(hostname)) throw new Error('数据源地址不允许指向本地或私有网络');
+	const bareHostname = hostname.replace(/^\[|\]$/g, '');
+	const mappedMatch = bareHostname.match(/^::ffff:(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f]+):([0-9a-f]+))$/i);
+	const mappedIPv4 = mappedMatch?.[1] || (mappedMatch ? `${parseInt(mappedMatch[2], 16) >>> 8}.${parseInt(mappedMatch[2], 16) & 255}.${parseInt(mappedMatch[3], 16) >>> 8}.${parseInt(mappedMatch[3], 16) & 255}` : '');
+	const privateIPv4 = /^(?:127\.|0\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])\.|198\.(?:1[89])\.|(?:22[4-9]|23\d)\.)/.test(mappedIPv4 || bareHostname);
+	if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') || hostname.endsWith('.internal') || privateIPv4 || /^(?:::\]?$$|::1|f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:|ff[0-9a-f]{2}:)/i.test(bareHostname)) throw new Error('数据源地址不允许指向本地或私有网络');
 	return url.href;
 }
 
@@ -1756,11 +1789,13 @@ async function 执行访问链接操作({ session, env, request, adminSession, i
 				ELSE MAX(COALESCE(expires_at, ?2), ?2) + ?1 * 1000 END
 			WHERE id = ?3 AND NOT (duration_seconds = 0 AND expires_at IS NULL)`).bind(seconds, now, id).run();
 	} else if (action === 'reset') {
-		关闭本实例链接连接(id);
-		await session.prepare('DELETE FROM access_connection_leases WHERE access_link_id = ?1').bind(id).run();
-		result = await session.prepare(`UPDATE access_links SET status = 'active', proxy_ip = NULL, first_used_at = NULL,
+		[, result] = await env.DB.batch([
+			session.prepare('DELETE FROM access_connection_leases WHERE access_link_id = ?1').bind(id),
+			session.prepare(`UPDATE access_links SET status = 'active', proxy_ip = NULL, first_used_at = NULL,
 			expires_at = NULL, last_used_at = NULL, connection_count = 0, active_connections = 0,
-			last_client_ip = NULL, last_client_asn = NULL, bound_ip = NULL, connection_epoch = connection_epoch + 1 WHERE id = ?1`).bind(id).run();
+			last_client_ip = NULL, last_client_asn = NULL, bound_ip = NULL, connection_epoch = connection_epoch + 1 WHERE id = ?1`).bind(id)
+		]);
+		关闭本实例链接连接(id);
 	} else if (action === 'reassign') {
 		const candidate = await session.prepare(`SELECT proxy_ip FROM proxy_ip_pool WHERE country = ?1 AND enabled = 1
 			AND proxy_ip <> COALESCE(?2, '') AND (cooldown_until IS NULL OR cooldown_until <= ?3)
@@ -1772,7 +1807,9 @@ async function 执行访问链接操作({ session, env, request, adminSession, i
 		const mode = String(body.mode || 'both');
 		if (!['token', 'uuid', 'both'].includes(mode)) throw new Error('轮换类型无效');
 		const rotated = 生成轮换访问凭据(before, mode);
-		result = await session.prepare('UPDATE access_links SET token = ?1, uuid = ?2 WHERE id = ?3').bind(rotated.token, rotated.uuid, id).run();
+		if (mode === 'token') result = await session.prepare('UPDATE access_links SET token = ?1 WHERE id = ?2').bind(rotated.token, id).run();
+		else if (mode === 'uuid') result = await session.prepare('UPDATE access_links SET uuid = ?1 WHERE id = ?2').bind(rotated.uuid, id).run();
+		else result = await session.prepare('UPDATE access_links SET token = ?1, uuid = ?2 WHERE id = ?3').bind(rotated.token, rotated.uuid, id).run();
 	} else if (action === 'edit') {
 		const maxConcurrent = Math.floor(Number(body.maxConcurrentConnections ?? body.max_concurrent_connections ?? 0));
 		const maxTotal = Math.floor(Number(body.maxTotalConnections ?? body.max_total_connections ?? 0));
@@ -2376,7 +2413,8 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 		}
 	}
 
-	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
+	// 连接器按请求追踪 socket，无需修改运行时的 fetcher。
+	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, cancelled: false, sockets: new Set() };
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	const responseHeaders = new Headers({
@@ -2405,6 +2443,7 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 	};
 
 	let XHTTP上行写入队列 = null;
+	let 关闭XHTTP连接 = null;
 	let XHTTP访问到期定时器 = null;
 	const 结束XHTTP访问授权 = (success, errorCode) => {
 		if (XHTTP访问到期定时器) clearTimeout(XHTTP访问到期定时器);
@@ -2430,23 +2469,28 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 									: new Uint8Array(data);
 						controller.enqueue(chunk);
 					} catch (e) {
-						已关闭 = true;
-						this.readyState = WebSocket.CLOSED;
-						void 结束XHTTP访问授权(访问授权上下文?.代理连接成功, 'client_cancelled');
+						void 关闭连接(访问授权上下文?.代理连接成功, 'client_cancelled');
 					}
 				},
 				close() {
-					if (已关闭) return;
-					已关闭 = true;
-					this.readyState = WebSocket.CLOSED;
-					try { controller.close() } catch (e) { }
-					void 结束XHTTP访问授权(访问授权上下文?.代理连接成功, 访问授权上下文?.代理连接成功 ? '' : 'upstream_failed');
+					void 关闭连接();
 				}
 			};
-			XHTTP访问到期定时器 = 安排访问链接到期(访问授权上下文, () => {
+			const 关闭连接 = 关闭XHTTP连接 = (success = 访问授权上下文?.代理连接成功, errorCode = '') => {
+				if (已关闭) return 访问授权上下文?.释放任务;
+				已关闭 = true;
+				remoteConnWrapper.cancelled = true;
+				xhttpBridge.readyState = WebSocket.CLOSED;
+				XHTTP上行写入队列?.清空();
+				for (const socket of remoteConnWrapper.sockets) { try { socket.close?.() } catch (_) { } }
 				try { remoteConnWrapper.socket?.close() } catch (e) { }
-				closeSocketQuietly(xhttpBridge);
-			});
+				void reader.cancel().catch(() => { });
+				释放远端写入器();
+				try { reader.releaseLock() } catch (e) { }
+				try { controller.close() } catch (e) { }
+				return 结束XHTTP访问授权(success, errorCode || (success ? '' : 'upstream_failed'));
+			};
+			XHTTP访问到期定时器 = 安排访问链接到期(访问授权上下文, 关闭连接);
 
 			const 上行写入队列 = XHTTP上行写入队列 = 创建上行写入队列({
 				获取写入器: 获取远端写入器,
@@ -2455,10 +2499,7 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 					if (typeof remoteConnWrapper.retryConnect !== 'function') throw new Error('retry unavailable');
 					await remoteConnWrapper.retryConnect();
 				},
-				关闭连接: () => {
-					try { remoteConnWrapper.socket?.close() } catch (e) { }
-					closeSocketQuietly(xhttpBridge);
-				},
+				关闭连接,
 				名称: 'XHTTP上行'
 			});
 
@@ -2477,9 +2518,9 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 					await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, xhttpBridge, 首包.respHeader, remoteConnWrapper, yourUUID, request, 访问授权上下文?.反代上下文 || 请求反代上下文);
 				}
 
-				while (true) {
+				while (!已关闭) {
 					const { done, value } = await reader.read();
-					if (done) break;
+					if (done || 已关闭) break;
 					if (!value || value.byteLength === 0) continue;
 					if (首包.isUDP) {
 						if (首包.协议 === 'trojan') await 转发木马UDP数据(value, xhttpBridge, 木马UDP上下文, request, 访问授权上下文);
@@ -2490,7 +2531,7 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 					}
 				}
 
-				if (!首包.isUDP) {
+				if (!已关闭 && !首包.isUDP) {
 					await 上行写入队列.等待空();
 					const writer = 获取远端写入器();
 					if (writer) {
@@ -2507,11 +2548,7 @@ async function 处理XHTTP请求(request, yourUUID, 访问授权上下文 = null
 			}
 		},
 		cancel() {
-			XHTTP上行写入队列?.清空();
-			try { remoteConnWrapper.socket?.close() } catch (e) { }
-			释放远端写入器();
-			try { reader.releaseLock() } catch (e) { }
-			结束XHTTP访问授权(访问授权上下文?.代理连接成功, 'client_cancelled');
+			return 关闭XHTTP连接?.(访问授权上下文?.代理连接成功, 'client_cancelled');
 		}
 	}), { status: 200, headers: responseHeaders });
 }
@@ -2523,7 +2560,7 @@ function 有效数据长度(data) {
 	return 0;
 }
 
-async function 读取XHTTP首包(reader, token) {
+function 尝试解析传输首包(data, token) {
 	const decoder = VLESS文本解码器;
 
 	const 尝试解析魏烈思首包 = (data) => {
@@ -2644,6 +2681,14 @@ async function 读取XHTTP首包(reader, token) {
 		};
 	};
 
+	const 木马结果 = 尝试解析木马首包(data);
+	if (木马结果.状态 === 'ok') return 木马结果;
+	const 魏烈思结果 = 尝试解析魏烈思首包(data);
+	if (魏烈思结果.状态 === 'ok') return 魏烈思结果;
+	return { 状态: 木马结果.状态 === 'invalid' && 魏烈思结果.状态 === 'invalid' ? 'invalid' : 'need_more' };
+}
+
+async function 读取XHTTP首包(reader, token) {
 	let buffer = new Uint8Array(1024);
 	let offset = 0;
 
@@ -2665,27 +2710,21 @@ async function 读取XHTTP首包(reader, token) {
 		offset += chunk.byteLength;
 
 		const 当前数据 = buffer.subarray(0, offset);
-		const 木马结果 = 尝试解析木马首包(当前数据);
-		if (木马结果.状态 === 'ok') return { ...木马结果.结果, reader };
-
-		const 魏烈思结果 = 尝试解析魏烈思首包(当前数据);
-		if (魏烈思结果.状态 === 'ok') return { ...魏烈思结果.结果, reader };
-
-		if (木马结果.状态 === 'invalid' && 魏烈思结果.状态 === 'invalid') return null;
+		const 解析结果 = 尝试解析传输首包(当前数据, token);
+		if (解析结果.状态 === 'ok') return { ...解析结果.结果, reader };
+		if (解析结果.状态 === 'invalid') return null;
 	}
 
 	const 最终数据 = buffer.subarray(0, offset);
-	const 最终木马结果 = 尝试解析木马首包(最终数据);
-	if (最终木马结果.状态 === 'ok') return { ...最终木马结果.结果, reader };
-	const 最终魏烈思结果 = 尝试解析魏烈思首包(最终数据);
-	if (最终魏烈思结果.状态 === 'ok') return { ...最终魏烈思结果.结果, reader };
+	const 最终结果 = 尝试解析传输首包(最终数据, token);
+	if (最终结果.状态 === 'ok') return { ...最终结果.结果, reader };
 	return null;
 }
 ///////////////////////////////////////////////////////////////////////gRPC传输数据///////////////////////////////////////////////
 async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null, 请求反代上下文 = null) {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
 	const reader = request.body.getReader();
-	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
+	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, cancelled: false, sockets: new Set() };
 	let isDnsQuery = false;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
 	let 判断是否是木马 = null;
@@ -2782,6 +2821,8 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 			const 关闭连接 = 关闭GRPC连接 = (success = 访问授权上下文?.代理连接成功, errorCode = '') => {
 				if (已关闭) return 访问授权上下文?.释放任务;
 				已关闭 = true;
+				remoteConnWrapper.cancelled = true;
+				for (const socket of remoteConnWrapper.sockets) { try { socket.close?.() } catch (_) { } }
 				GRPC上行写入队列?.清空();
 				刷新发送队列(true);
 				grpcBridge.readyState = WebSocket.CLOSED;
@@ -2832,6 +2873,7 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 
 			try {
 				let pending = new Uint8Array(0);
+				let 首包缓存 = new Uint8Array(0);
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) break;
@@ -2842,7 +2884,8 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 					merged.set(当前块, pending.length);
 					pending = merged;
 					while (pending.byteLength >= 5) {
-						const grpcLen = ((pending[1] << 24) >>> 0) | (pending[2] << 16) | (pending[3] << 8) | pending[4];
+						const grpcLen = new DataView(pending.buffer, pending.byteOffset, 5).getUint32(1);
+						if (pending[0] !== 0 || grpcLen > 上行队列最大字节) throw new Error('Invalid gRPC frame');
 						const frameSize = 5 + grpcLen;
 						if (pending.byteLength < frameSize) break;
 						const grpcPayload = pending.subarray(5, frameSize);
@@ -2873,8 +2916,14 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 						if (remoteConnWrapper.socket) {
 							if (!(await 写入远端(payload))) throw new Error('Remote socket is not ready');
 						} else {
-							const 首包bytes = 数据转Uint8Array(payload);
-							if (判断是否是木马 === null) 判断是否是木马 = 首包bytes.byteLength >= 58 && 首包bytes[56] === 0x0d && 首包bytes[57] === 0x0a;
+							// gRPC 消息边界不保证与代理协议首包边界一致。
+							首包缓存 = 拼接字节数据(首包缓存, payload);
+							const 首包解析 = 尝试解析传输首包(首包缓存, yourUUID);
+							if (首包解析.状态 === 'need_more' && 首包缓存.byteLength <= 1024) continue;
+							if (首包解析.状态 !== 'ok') throw new Error('Invalid proxy header');
+							const 首包bytes = 首包缓存;
+							首包缓存 = new Uint8Array(0);
+							判断是否是木马 = 首包解析.结果.协议 === 'trojan';
 							if (判断是否是木马) {
 								const 解析结果 = 解析木马请求(首包bytes, yourUUID);
 								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
@@ -2919,6 +2968,8 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 					}
 					刷新发送队列();
 				}
+				if (pending.byteLength) throw new Error('Incomplete gRPC frame');
+				if (首包缓存.byteLength) throw new Error('Incomplete proxy header');
 				await 上行写入队列.等待空();
 				if (!已关闭 && !isDnsQuery && remoteConnWrapper.socket) {
 					// 上传 EOF 只关闭 TCP 写端，下行 EOF 或客户端取消时才释放连接和租约。
@@ -3756,13 +3807,15 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${当前反代IP} | 反代兜底: ${当前启用反代兜底 ? '是' : '否'} | 反代类型: ${当前启用SOCKS5反代 || 'proxyip'} | 全局: ${当前启用SOCKS5全局反代 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
 	let 已通过代理发送首包 = false;
-	const TCP连接 = 创建请求TCP连接器(request);
+	const TCP连接 = 创建请求TCP连接器(request, remoteConnWrapper);
 
 	async function 等待连接建立(remoteSock, timeoutMs = 连接超时毫秒) {
+		if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
 		await Promise.race([
 			remoteSock.opened,
 			new Promise((_, reject) => setTimeout(() => reject(new Error('连接超时')), timeoutMs))
 		]);
+		if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
 	}
 
 	async function 打开TCP连接(address, port) {
@@ -3778,12 +3831,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 	async function 写入首包(remoteSock, data) {
 		if (有效数据长度(data) <= 0) return;
+		if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
 		const writer = remoteSock.writable.getWriter();
 		try { await writer.write(数据转Uint8Array(data)) }
 		finally { try { writer.releaseLock() } catch (e) { } }
 	}
 
 	async function 并发打开候选连接(候选列表, 记录代理健康 = false) {
+		if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
 		if (候选列表.length === 1) {
 			const 候选 = 候选列表[0];
 			const startedAt = Date.now();
@@ -3823,8 +3878,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 
 	async function connectDirect(address, port, data = null, 所有反代数组 = null, 反代兜底 = true) {
+		if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
 		if (所有反代数组 && 所有反代数组.length > 0) {
 			for (let i = 0; i < 所有反代数组.length; i += TCP并发拨号数) {
+				if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
 				const 候选列表 = [];
 				for (let j = 0; j < TCP并发拨号数 && i + j < 所有反代数组.length; j++) {
 					const 反代数组索引 = (缓存反代数组索引 + i + j) % 所有反代数组.length;
@@ -3868,6 +3925,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 
 	async function connecttoPry(允许发送首包 = true) {
+		if (remoteConnWrapper.cancelled) return;
 		if (ws.readyState !== WebSocket.OPEN) return;
 		if (remoteConnWrapper.connectingPromise) {
 			await remoteConnWrapper.connectingPromise;
@@ -3911,7 +3969,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				const 所有反代数组 = await 解析地址端口(当前反代IP, host, yourUUID);
 				newSocket = await connectDirect(atob('UFJPWFlJUC50cDEuMDkwMjI3Lnh5eg=='), 1, 本次首包数据, 所有反代数组, 当前启用反代兜底);
 			}
-			if (ws.readyState !== WebSocket.OPEN) { try { newSocket.close() } catch (_) { } return; }
+			if (remoteConnWrapper.cancelled || ws.readyState !== WebSocket.OPEN) { try { newSocket.close() } catch (_) { } return; }
 			if (本次发送首包) 已通过代理发送首包 = true;
 			remoteConnWrapper.socket = newSocket;
 			newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
@@ -4361,8 +4419,14 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 			}
 		}
 		await 下行发送器.flush();
-	} catch (err) { closeSocketQuietly(webSocket) }
-	finally { try { reader.cancel() } catch (e) { } try { reader.releaseLock() } catch (e) { } }
+	} catch (err) {
+		// 首个响应到达前的读取错误也允许代理回退；已有响应时不能重放请求。
+		if (hasData || !retryFunc) closeSocketQuietly(webSocket);
+		try { remoteSocket.close() } catch (e) { }
+	} finally {
+		try { await reader.cancel() } catch (e) { }
+		try { reader.releaseLock() } catch (e) { }
+	}
 	if (!hasData && retryFunc && webSocket.readyState === WebSocket.OPEN) await retryFunc();
 }
 
@@ -4615,11 +4679,19 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, 代�
 	}
 }
 
-function 创建请求TCP连接器(request) {
+function 创建请求TCP连接器(request, state = null) {
 	const 请求对象 = /** @type {any} */ (request);
 	const fetcher = 请求对象?.fetcher;
 	if (!fetcher || typeof fetcher.connect !== 'function') throw new Error('request.fetcher.connect unavailable');
-	return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
+	return (options, init) => {
+		if (state?.cancelled) throw new Error('连接已取消');
+		const socket = init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
+		if (state?.sockets) {
+			state.sockets.add(socket);
+			socket.closed?.then(() => state.sockets.delete(socket), () => state.sockets.delete(socket));
+		}
+		return socket;
+	};
 }
 ////////////////////////////////////////////TLSClient by: @Alexandre_Kojeve////////////////////////////////////////////////
 const TLS_VERSION_10 = 769, TLS_VERSION_12 = 771, TLS_VERSION_13 = 772;
@@ -6608,7 +6680,8 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 	if (!env.KV || typeof env.KV.get !== 'function') return;
 	try {
 		const 当前时间 = new Date();
-		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
+		const cf = request.cf || {};
+		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${cf.asn || '0'} ${cf.asOrganization || 'Unknown'}`, CC: `${cf.country || 'N/A'} ${cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
 		if (config_JSON.TG.启用) {
 			try {
 				const TG_TXT = await env.KV.get('tg.json');
@@ -7116,7 +7189,8 @@ async function 生成随机IP(request, count = 16, 指定端口 = -1) {
 	const cfname = 运营商名称映射[运营商文件标识] || 'CF官方优选';
 	const cfport = [443, 2053, 2083, 2087, 2096, 8443];
 	let cidrList = [];
-	try { const res = await fetch(cidr_url); cidrList = res.ok ? await 整理成数组(await res.text()) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
+	try { const res = await fetch(cidr_url); cidrList = res.ok ? (await 整理成数组(await res.text())).filter(c => /^\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}$/.test(c)) : [] } catch { cidrList = [] }
+	if (!cidrList.length) cidrList = ['104.16.0.0/13'];
 
 	const generateRandomIPFromCIDR = (cidr) => {
 		const [baseIP, prefixLength] = cidr.split('/'), prefix = parseInt(prefixLength), hostBits = 32 - prefix;
