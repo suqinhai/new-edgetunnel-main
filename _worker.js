@@ -108,7 +108,7 @@ export default {
 				管理员会话 = await 验证管理员会话(request, env);
 				if (!管理员会话) return new Response('重定向中...', { status: 302, headers: { 'Location': '/login', 'Cache-Control': 'no-store' } });
 			}
-			if (env.KV && typeof env.KV.get === 'function') {
+			if ((env.KV && typeof env.KV.get === 'function') || (访问路径 === 'sub' && 访问授权上下文)) {
 				const 区分大小写访问路径 = url.pathname.slice(1);
 				if (区分大小写访问路径 === 加密秘钥 && 加密秘钥 !== '勿动此默认密钥，有需求请自行通过添加变量KEY进行修改') {//快速订阅
 					const params = new URLSearchParams(url.search);
@@ -460,9 +460,12 @@ export default {
 								const 链式代理匹配 = 节点备注.match(/\$(socks5|http|https|turn|sstp):\/\/([^#\s]+)/i);
 								if (链式代理匹配) {
 									try {
-										const 代理协议 = 链式代理匹配[1].toLowerCase(), 代理参数 = 链式代理匹配[2];
-										const 链式代理数据 = { type: 代理协议, ...获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议)) };
-										完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), 请求用户ID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
+										// 限时链接始终使用其令牌路径及国家池，不能被备注中的代理覆盖。
+										if (!动态访问订阅) {
+											const 代理协议 = 链式代理匹配[1].toLowerCase(), 代理参数 = 链式代理匹配[2];
+											const 链式代理数据 = { type: 代理协议, ...获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议)) };
+											完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), 请求用户ID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
+										}
 										节点备注 = 节点备注.replace(链式代理匹配[0], '').trim() || 节点地址;
 									} catch (error) {
 										console.warn(`[订阅内容] 链式代理解析失败，已忽略该指令: ${链式代理匹配[0]} (${error && error.message ? error.message : error})`);
@@ -543,6 +546,7 @@ export default {
 		if (伪装页URL === '1101') return new Response(await html1101(url.host, 访问IP), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 		try {
 			const 反代URL = new URL(伪装页URL), 新请求头 = new Headers(request.headers);
+			for (const name of ['Cookie', 'Authorization', 'Proxy-Authorization', 'X-CSRF-Token']) 新请求头.delete(name);
 			新请求头.set('Host', 反代URL.host);
 			新请求头.set('Referer', 反代URL.origin);
 			新请求头.set('Origin', 反代URL.origin);
@@ -1014,6 +1018,7 @@ async function 查询健康访问代理候选(session, country, currentProxy, no
 async function 激活访问授权上下文(上下文) {
 	if (!上下文) return null;
 	if (上下文.激活任务) return await 上下文.激活任务;
+	const 请求认证UUID = 上下文.记录.uuid;
 	上下文.激活任务 = (async () => {
 		await 确保访问数据库(上下文.env);
 		const session = 获取访问数据库会话(上下文.env);
@@ -1030,6 +1035,7 @@ async function 激活访问授权上下文(上下文) {
 		}
 		const 读取错误 = 访问限制错误(记录, 上下文.clientIP);
 		if (读取错误) throw Object.assign(new Error(读取错误.message), { status: 读取错误.status });
+		if (记录.uuid !== 请求认证UUID) throw Object.assign(new Error('访问凭据已轮换，请更新节点后重试'), { status: 403 });
 
 		let IP结果 = await 查询健康访问代理候选(session, 记录.country, 记录.proxy_ip);
 		if (!(IP结果.results || []).length) {
@@ -1048,8 +1054,9 @@ async function 激活访问授权上下文(上下文) {
 				WHERE token = ?5 AND status = 'active' AND (expires_at IS NULL OR expires_at > ?3)
 					AND (max_total_connections = 0 OR connection_count < max_total_connections)
 					AND (max_concurrent_connections = 0 OR active_connections < max_concurrent_connections)
-					AND (bind_first_ip = 0 OR bound_ip IS NULL OR bound_ip = ?6)`)
-				.bind(上下文.leaseId, 选定反代IP, now, leaseExpiresAt, 记录.token, 上下文.clientIP || ''),
+					AND (bind_first_ip = 0 OR bound_ip IS NULL OR bound_ip = ?6)
+					AND uuid = ?7`)
+				.bind(上下文.leaseId, 选定反代IP, now, leaseExpiresAt, 记录.token, 上下文.clientIP || '', 请求认证UUID),
 			session.prepare(`UPDATE access_links SET
 			proxy_ip = ?1,
 			first_used_at = COALESCE(first_used_at, ?2),
@@ -1744,9 +1751,10 @@ async function 执行访问链接操作({ session, env, request, adminSession, i
 		if (!Number.isInteger(hours) || hours < 1 || hours > 8760) throw new Error('续期时长必须是 1 到 8760 小时');
 		if (Number(before.duration_seconds) === 0 && before.expires_at == null) throw new Error('永久链接无需续期');
 		const seconds = hours * 3600;
-		const renewedExpiry = 计算访问链接续期到期时间(before, now, hours);
 		result = await session.prepare(`UPDATE access_links SET status = 'active', duration_seconds = duration_seconds + ?1,
-			expires_at = ?2 WHERE id = ?3`).bind(seconds, renewedExpiry, id).run();
+			expires_at = CASE WHEN first_used_at IS NULL THEN NULL
+				ELSE MAX(COALESCE(expires_at, ?2), ?2) + ?1 * 1000 END
+			WHERE id = ?3 AND NOT (duration_seconds = 0 AND expires_at IS NULL)`).bind(seconds, now, id).run();
 	} else if (action === 'reset') {
 		关闭本实例链接连接(id);
 		await session.prepare('DELETE FROM access_connection_leases WHERE access_link_id = ?1').bind(id).run();
@@ -2684,6 +2692,7 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	let GRPC上行写入队列 = null;
+	let 关闭GRPC连接 = null;
 	//log('[gRPC] 开始处理双向流');
 	const grpcHeaders = new Headers({
 		'Content-Type': 'application/grpc',
@@ -2730,11 +2739,7 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 					安排刷新发送队列();
 				},
 				close() {
-					if (this.readyState === WebSocket.CLOSED) return;
-					刷新发送队列(true);
-					已关闭 = true;
-					this.readyState = WebSocket.CLOSED;
-					try { controller.close() } catch (e) { }
+					void 关闭连接();
 				}
 			};
 
@@ -2756,8 +2761,7 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 				try {
 					controller.enqueue(out);
 				} catch (e) {
-					已关闭 = true;
-					grpcBridge.readyState = WebSocket.CLOSED;
+					void 关闭连接(访问授权上下文?.代理连接成功, 'client_cancelled');
 				}
 			};
 
@@ -2775,11 +2779,11 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 				});
 			};
 
-			const 关闭连接 = () => {
-				if (已关闭) return;
+			const 关闭连接 = 关闭GRPC连接 = (success = 访问授权上下文?.代理连接成功, errorCode = '') => {
+				if (已关闭) return 访问授权上下文?.释放任务;
+				已关闭 = true;
 				GRPC上行写入队列?.清空();
 				刷新发送队列(true);
-				已关闭 = true;
 				grpcBridge.readyState = WebSocket.CLOSED;
 				if (刷新定时器) clearTimeout(刷新定时器);
 				if (远端写入器) {
@@ -2787,9 +2791,11 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 					远端写入器 = null;
 				}
 				当前写入Socket = null;
+				void reader.cancel().catch(() => { });
 				try { reader.releaseLock() } catch (e) { }
 				try { remoteConnWrapper.socket?.close() } catch (e) { }
 				try { controller.close() } catch (e) { }
+				return 结束访问授权上下文(访问授权上下文, success, errorCode || (success ? '' : 'upstream_failed'));
 			};
 
 			const 释放远端写入器 = () => {
@@ -2914,20 +2920,23 @@ async function 处理gRPC请求(request, yourUUID, 访问授权上下文 = null,
 					刷新发送队列();
 				}
 				await 上行写入队列.等待空();
+				if (!已关闭 && !isDnsQuery && remoteConnWrapper.socket) {
+					// 上传 EOF 只关闭 TCP 写端，下行 EOF 或客户端取消时才释放连接和租约。
+					释放远端写入器();
+					远端写入器 = remoteConnWrapper.socket.writable.getWriter();
+					await 远端写入器.close();
+				} else if (!已关闭) await 关闭连接();
 			} catch (err) {
 				log(`[gRPC转发] 处理失败: ${err?.message || err}`);
+				await 关闭连接(false, 'upstream_failed');
 			} finally {
 				上行写入队列.清空();
 				释放远端写入器();
-				关闭连接();
-				await 结束访问授权上下文(访问授权上下文, 访问授权上下文?.代理连接成功, 访问授权上下文?.代理连接成功 ? '' : 'upstream_failed');
+				try { reader.releaseLock() } catch (e) { }
 			}
 		},
 		cancel() {
-			GRPC上行写入队列?.清空();
-			try { remoteConnWrapper.socket?.close() } catch (e) { }
-			try { reader.releaseLock() } catch (e) { }
-			结束访问授权上下文(访问授权上下文, 访问授权上下文?.代理连接成功, 'client_cancelled');
+			return 关闭GRPC连接?.(访问授权上下文?.代理连接成功, 'client_cancelled');
 		}
 	}), { status: 200, headers: grpcHeaders });
 }
@@ -3859,6 +3868,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 
 	async function connecttoPry(允许发送首包 = true) {
+		if (ws.readyState !== WebSocket.OPEN) return;
 		if (remoteConnWrapper.connectingPromise) {
 			await remoteConnWrapper.connectingPromise;
 			return;
@@ -3901,6 +3911,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				const 所有反代数组 = await 解析地址端口(当前反代IP, host, yourUUID);
 				newSocket = await connectDirect(atob('UFJPWFlJUC50cDEuMDkwMjI3Lnh5eg=='), 1, 本次首包数据, 所有反代数组, 当前启用反代兜底);
 			}
+			if (ws.readyState !== WebSocket.OPEN) { try { newSocket.close() } catch (_) { } return; }
 			if (本次发送首包) 已通过代理发送首包 = true;
 			remoteConnWrapper.socket = newSocket;
 			newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
@@ -3930,6 +3941,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		try {
 			log(`[TCP转发] 尝试直连到: ${host}:${portNum}`);
 			const initialSocket = await connectDirect(host, portNum, rawData);
+			if (ws.readyState !== WebSocket.OPEN) { try { initialSocket.close() } catch (_) { } return; }
 			if (当前访问授权上下文) 当前访问授权上下文.代理连接成功 = true;
 			remoteConnWrapper.socket = initialSocket;
 			connectStreams(initialSocket, ws, respHeader, async () => {
@@ -3945,45 +3957,65 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 }
 
+const DNS转发状态 = new WeakMap();
+
 async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, 访问授权上下文 = null) {
-	const 请求数据 = 数据转Uint8Array(udpChunk);
-	const 请求字节数 = 请求数据.byteLength;
-	log(`[UDP转发] 收到 DNS 请求: ${请求字节数}B -> 8.8.4.4:53`);
-	try {
-		const TCP连接 = 创建请求TCP连接器(request);
-		const tcpSocket = TCP连接({ hostname: '8.8.4.4', port: 53 });
-		let 魏烈思Header = respHeader;
-		const writer = tcpSocket.writable.getWriter();
-		await writer.write(请求数据);
-		log(`[UDP转发] DNS 请求已写入上游: ${请求字节数}B`);
-		writer.releaseLock();
-		await tcpSocket.readable.pipeTo(new WritableStream({
-			async write(chunk) {
-				const 原始响应 = 数据转Uint8Array(chunk);
-				log(`[UDP转发] 收到 DNS 响应: ${原始响应.byteLength}B`);
-				const 封装结果 = 响应封装器 ? await 响应封装器(原始响应) : 原始响应;
-				const 发送片段列表 = Array.isArray(封装结果) ? 封装结果 : [封装结果];
-				if (!发送片段列表.length) return;
-				if (webSocket.readyState !== WebSocket.OPEN) return;
-				for (const fragment of 发送片段列表) {
-					const 转发响应 = 数据转Uint8Array(fragment);
-					if (!转发响应.byteLength) continue;
-					if (魏烈思Header) {
-						const response = new Uint8Array(魏烈思Header.length + 转发响应.byteLength);
-						response.set(魏烈思Header, 0);
-						response.set(转发响应, 魏烈思Header.length);
-						await WebSocket发送并等待(webSocket, response.buffer);
-						魏烈思Header = null;
-					} else {
-						await WebSocket发送并等待(webSocket, 转发响应);
-					}
-				}
-			},
-		}));
-		if (访问授权上下文) 访问授权上下文.代理连接成功 = true;
-	} catch (error) {
-		log(`[UDP转发] DNS 转发失败: ${error?.message || error}`);
+	let 状态 = DNS转发状态.get(webSocket);
+	if (!状态) {
+		状态 = { 缓存: new Uint8Array(0), 响应头: respHeader, 已发送: false };
+		DNS转发状态.set(webSocket, 状态);
+	} else if (!状态.已发送 && respHeader) 状态.响应头 = respHeader;
+	const input = 拼接字节数据(状态.缓存, 数据转Uint8Array(udpChunk));
+	let cursor = 0;
+	while (cursor + 2 <= input.byteLength) {
+		const length = (input[cursor] << 8) | input[cursor + 1];
+		const end = cursor + 2 + length;
+		if (end > input.byteLength) break;
+		const query = input.subarray(cursor, end);
+		cursor = end;
+		if (!length) continue;
+		if (webSocket.readyState !== WebSocket.OPEN) break;
+		let socket, reader, writer;
+		try {
+			const TCP连接 = 创建请求TCP连接器(request);
+			socket = TCP连接({ hostname: '8.8.4.4', port: 53 });
+			writer = socket.writable.getWriter();
+			await withTimeout(writer.write(query), 10000, 'DNS write timed out');
+			writer.releaseLock();
+			writer = null;
+			reader = socket.readable.getReader();
+			// DNS over TCP 以两字节长度划分响应，不等待服务器关闭持久连接。
+			const response = new Uint8Array(65537);
+			let received = 0, expected = 2;
+			const deadline = Date.now() + 10000;
+			while (received < expected) {
+				const { done, value } = await withTimeout(reader.read(), Math.max(1, deadline - Date.now()), 'DNS response timed out');
+				if (done) throw new Error('Incomplete DNS response');
+				const bytes = 数据转Uint8Array(value);
+				const count = Math.min(bytes.byteLength, response.byteLength - received);
+				response.set(bytes.subarray(0, count), received);
+				received += count;
+				if (received >= 2) expected = 2 + ((response[0] << 8) | response[1]);
+			}
+			const data = response.subarray(0, expected);
+			const wrapped = 响应封装器 ? await 响应封装器(data) : data;
+			for (const fragment of Array.isArray(wrapped) ? wrapped : [wrapped]) {
+				const bytes = 数据转Uint8Array(fragment);
+				if (!bytes.byteLength || webSocket.readyState !== WebSocket.OPEN) continue;
+				await WebSocket发送并等待(webSocket, 状态.响应头 ? 拼接字节数据(状态.响应头, bytes) : bytes);
+				状态.响应头 = null;
+				状态.已发送 = true;
+			}
+			if (访问授权上下文) 访问授权上下文.代理连接成功 = true;
+		} catch (error) {
+			log(`[UDP转发] DNS 转发失败: ${error?.message || error}`);
+		} finally {
+			if (reader) { void reader.cancel().catch(() => { }); try { reader.releaseLock() } catch (_) { } }
+			if (writer) { try { writer.releaseLock() } catch (_) { } }
+			try { socket?.close() } catch (_) { }
+		}
 	}
+	状态.缓存 = webSocket.readyState === WebSocket.OPEN ? input.slice(cursor) : new Uint8Array(0);
 }
 
 function closeSocketQuietly(socket) {
@@ -4331,7 +4363,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 		await 下行发送器.flush();
 	} catch (err) { closeSocketQuietly(webSocket) }
 	finally { try { reader.cancel() } catch (e) { } try { reader.releaseLock() } catch (e) { } }
-	if (!hasData && retryFunc) await retryFunc();
+	if (!hasData && retryFunc && webSocket.readyState === WebSocket.OPEN) await retryFunc();
 }
 
 function isSpeedTestSite(hostname) {
@@ -6573,6 +6605,7 @@ function Surge订阅配置文件热补丁(content, url, config_JSON) {
 }
 
 async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SUB", config_JSON, 是否写入KV日志 = true) {
+	if (!env.KV || typeof env.KV.get !== 'function') return;
 	try {
 		const 当前时间 = new Date();
 		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
@@ -6902,9 +6935,9 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 	};
 
 	try {
-		let configJSON = await env.KV.get('config.json');
+		let configJSON = await env.KV?.get?.('config.json');
 		if (!configJSON || 重置配置 == true) {
-			await env.KV.put('config.json', JSON.stringify(默认配置JSON, null, 2));
+			await env.KV?.put?.('config.json', JSON.stringify(默认配置JSON, null, 2));
 			config_JSON = 默认配置JSON;
 		} else {
 			config_JSON = JSON.parse(configJSON);
@@ -6993,9 +7026,9 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 	const 初始化TG_JSON = { BotToken: null, ChatID: null };
 	config_JSON.TG = { 启用: config_JSON.TG.启用 ? config_JSON.TG.启用 : false, ...初始化TG_JSON };
 	try {
-		const TG_TXT = await env.KV.get('tg.json');
+		const TG_TXT = await env.KV?.get?.('tg.json');
 		if (!TG_TXT) {
-			await env.KV.put('tg.json', JSON.stringify(初始化TG_JSON, null, 2));
+			await env.KV?.put?.('tg.json', JSON.stringify(初始化TG_JSON, null, 2));
 		} else {
 			const TG_JSON = JSON.parse(TG_TXT);
 			config_JSON.TG.ChatID = TG_JSON.ChatID ? TG_JSON.ChatID : null;
@@ -7008,9 +7041,9 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 	const 初始化CF_JSON = { Email: null, GlobalAPIKey: null, AccountID: null, APIToken: null, UsageAPI: null };
 	config_JSON.CF = { ...初始化CF_JSON, Usage: { success: false, pages: 0, workers: 0, total: 0, max: 100000 } };
 	try {
-		const CF_TXT = await env.KV.get('cf.json');
+		const CF_TXT = await env.KV?.get?.('cf.json');
 		if (!CF_TXT) {
-			await env.KV.put('cf.json', JSON.stringify(初始化CF_JSON, null, 2));
+			await env.KV?.put?.('cf.json', JSON.stringify(初始化CF_JSON, null, 2));
 		} else {
 			const CF_JSON = JSON.parse(CF_TXT);
 			if (CF_JSON.UsageAPI) {
@@ -7852,6 +7885,9 @@ export const __test = Object.freeze({
 	获取TCP反代配置,
 	forwardataTCP,
 	处理XHTTP请求,
+	处理gRPC请求,
+	forwardataudp,
+	执行访问链接操作,
 	socks5Connect,
 	访问链接增强管理页面
 });
