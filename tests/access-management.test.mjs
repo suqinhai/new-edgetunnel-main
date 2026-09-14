@@ -131,6 +131,24 @@ test('批量操作能报告部分成功与失败明细', () => {
   assert.deepEqual(summary.failed.map(item => item.id), [2]);
 });
 
+test('批量链接导出每条记录独占一行并包含订阅与访问链接', () => {
+  const content = __test.格式化批量访问链接导出([
+    { subscription_url: 'https://example.com/sub?token=one', node_url: 'vless://first@example.com' },
+    { subscription_url: "https://example.com/sub?token=o'ne", node_url: 'vless://second\\path@example.com' }
+  ]);
+  assert.equal(content,
+    "['https://example.com/sub?token=one','vless://first@example.com']\r\n" +
+    "['https://example.com/sub?token=o\\'ne','vless://second\\\\path@example.com']\r\n");
+  assert.equal(__test.格式化批量访问链接导出([]), '');
+});
+
+test('访问链接页面提供勾选记录的批量订阅和链接导出', async () => {
+  const html = await __test.访问链接增强管理页面().text();
+  assert.match(html, /<option value="export">导出订阅和链接<\/option>/);
+  assert.match(html, /action==='export'\?exportSelected\(ids\):runAction/);
+  assert.match(html, /复制订阅<\/button><button[^>]+>复制链接<\/button>/);
+});
+
 test('外部数据源仅允许 HTTPS 且阻止本地与私网地址', () => {
   assert.equal(__test.标准化访问数据源URL('https://example.com/list.json'), 'https://example.com/list.json');
   assert.throws(() => __test.标准化访问数据源URL('http://example.com/list'), /HTTPS/);
