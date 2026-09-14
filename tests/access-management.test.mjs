@@ -131,14 +131,14 @@ test('批量操作能报告部分成功与失败明细', () => {
   assert.deepEqual(summary.failed.map(item => item.id), [2]);
 });
 
-test('批量链接导出每条记录独占一行并包含订阅与访问链接', () => {
+test('批量链接导出每条记录独占一行并包含订阅、访问链接、国家和有效时长', () => {
   const content = __test.格式化批量访问链接导出([
-    { subscription_url: 'https://example.com/sub?token=one', node_url: 'vless://first@example.com' },
-    { subscription_url: "https://example.com/sub?token=o'ne", node_url: 'vless://second\\path@example.com' }
+    { subscription_url: 'https://example.com/sub?token=one', node_url: 'vless://first@example.com', country: 'PH', duration_label: '3 小时' },
+    { subscription_url: "https://example.com/sub?token=o'ne", node_url: 'vless://second\\path@example.com', country: 'TW', duration_label: '永久' }
   ]);
   assert.equal(content,
-    "['https://example.com/sub?token=one','vless://first@example.com']\r\n" +
-    "['https://example.com/sub?token=o\\'ne','vless://second\\\\path@example.com']\r\n");
+    "['https://example.com/sub?token=one','vless://first@example.com','PH','3 小时']\r\n" +
+    "['https://example.com/sub?token=o\\'ne','vless://second\\\\path@example.com','TW','永久']\r\n");
   assert.equal(__test.格式化批量访问链接导出([]), '');
 });
 
@@ -146,7 +146,16 @@ test('访问链接页面提供勾选记录的批量订阅和链接导出', async
   const html = await __test.访问链接增强管理页面().text();
   assert.match(html, /<option value="export">导出订阅和链接<\/option>/);
   assert.match(html, /action==='export'\?exportSelected\(ids\):runAction/);
+  assert.match(html, /\['订阅地址','访问链接','国家','有效时长'\]/);
   assert.match(html, /复制订阅<\/button><button[^>]+>复制链接<\/button>/);
+});
+
+test('访问链接列表在桌面和移动端显示有效时长', async () => {
+  const html = await __test.访问链接增强管理页面().text();
+  assert.match(html, /<th>状态<\/th><th>有效时长<\/th><th>剩余时间<\/th>/);
+  assert.match(html, /<td>'\+esc\(x\.duration_label\)\+'<\/td><td data-countdown/);
+  assert.match(html, /有效时长 '\+esc\(x\.duration_label\)\+' · 剩余/);
+  assert.match(html, /colspan="10" class="empty"/);
 });
 
 test('外部数据源仅允许 HTTPS 且阻止本地与私网地址', () => {
