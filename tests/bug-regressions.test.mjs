@@ -635,11 +635,13 @@ for (const fixedUUID of [false, true]) {
     assert.equal(response.status, 200);
     assert.match(response.headers.get('Content-Type'), /text\/plain/);
     const nodes = (await response.text()).split('\n').map(link => new URL(link));
-    assert.equal(nodes.length, 16);
+    assert.equal(nodes.length, 1);
     for (const node of nodes) {
       assert.equal(node.protocol, 'vless:');
       assert.equal(node.username, uuid);
+      assert.equal(node.hostname, 'worker.example');
       assert.equal(node.searchParams.get('path'), '/u/' + token);
+      assert.match(decodeURIComponent(node.hash.slice(1)), /TW/);
     }
     const row = db.prepare('SELECT * FROM access_links WHERE id = 1').get();
     assert.equal(row.first_used_at, null);
@@ -666,7 +668,7 @@ test('链式代理备注保留限时订阅的令牌路径，普通订阅仍使�
   const limited = await worker.fetch(subscriptionRequest(token), env, ctx);
   assert.equal(limited.status, 200);
   const nodes = (await limited.text()).split('\n').map(link => new URL(link));
-  assert.equal(nodes.length, 5);
+  assert.equal(nodes.length, 1);
   for (const node of nodes) {
     assert.equal(node.searchParams.get('path'), '/custom/u/' + token + '?test=1&ed=2560');
     assert.doesNotMatch(decodeURIComponent(node.hash), /proxy\.example/);

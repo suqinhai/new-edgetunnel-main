@@ -387,7 +387,12 @@ export default {
 							const TLS分片参数 = config_JSON.TLS分片 == 'Shadowrocket' ? `&fragment=${encodeURIComponent('1,40-60,30-50,tlshello')}` : config_JSON.TLS分片 == 'Happ' ? `&fragment=${encodeURIComponent('3,1,tlshello')}` : '';
 							let 完整优选IP = [], 其他节点LINK = '', 反代IP池 = [];
 
-							if (!url.searchParams.has('sub') && config_JSON.优选订阅生成.local) { // 本地生成订阅
+							if (动态访问订阅) {
+								// 国家访问链接只需要一个入口。国家决定的是令牌路径后端使用的
+								// PROXYIP 池；继续生成默认的 16 个 Cloudflare 入口只会让客户端
+								// 出现一批实际共用同一国家出口的重复节点。
+								完整优选IP = [`${config_JSON.HOST}:443#${生成访问节点名称(访问授权上下文.记录)}`];
+							} else if (!url.searchParams.has('sub') && config_JSON.优选订阅生成.local) { // 本地生成订阅
 								const 完整优选列表 = config_JSON.优选订阅生成.本地IP库.随机IP ? (
 									await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口)
 								)[0] : await env.KV.get('ADD.txt') ? await 整理成数组(await env.KV.get('ADD.txt')) : (
@@ -1244,13 +1249,20 @@ function 生成访问节点链接(config, 记录) {
 	const ECHLINK参数 = config.ECH ? `&ech=${encodeURIComponent((config.ECHConfig?.SNI ? config.ECHConfig.SNI + '+' : '') + config.ECHConfig?.DNS)}` : '';
 	const { type: 传输协议, 路径字段名, 域名字段名 } = 获取传输协议配置(config);
 	const 传输路径参数值 = 获取传输路径参数值(config, 完整节点路径);
-	const 时长名称 = Number(记录.duration_seconds) === 0 ? '永久' : `${Math.round(Number(记录.duration_seconds) / 3600 * 100) / 100}小时`;
-	const 名称 = encodeURIComponent(记录.note || `${记录.country}-${时长名称}`);
+	const 名称 = encodeURIComponent(生成访问节点名称(记录));
 	if (config.协议类型 === 'ss') {
 		const ssPath = 完整节点路径.includes('?') ? 完整节点路径.replace('?', `?enc=${config.SS.加密方式}&`) : `${完整节点路径}?enc=${config.SS.加密方式}`;
 		return `ss://${btoa(config.SS.加密方式 + ':' + 记录.uuid)}@${host}:${config.SS.TLS ? '443' : '80'}?plugin=v2${encodeURIComponent(`ray-plugin;mode=websocket;host=${host};path=${ssPath}${config.SS.TLS ? ';tls' : ''};mux=0`)}${ECHLINK参数}#${名称}`;
 	}
 	return `${config.协议类型}://${记录.uuid}@${host}:443?security=tls&type=${传输协议}${ECHLINK参数}&${域名字段名}=${host}&fp=${config.Fingerprint}&sni=${host}&${路径字段名}=${encodeURIComponent(传输路径参数值)}${TLS分片参数}&encryption=none${config.跳过证书验证 ? '&insecure=1&allowInsecure=1' : ''}#${名称}`;
+}
+
+function 生成访问节点名称(记录) {
+	const 国家代码 = String(记录?.country || '').trim().toUpperCase();
+	const 国家名称 = 国家代码 ? (访问国家显示名称格式器?.of(国家代码) || 国家代码) : '国家节点';
+	const 国家标签 = 国家代码 && 国家名称 !== 国家代码 ? `${国家名称} (${国家代码})` : 国家名称;
+	const 时长名称 = Number(记录?.duration_seconds) === 0 ? '永久' : `${Math.round(Number(记录?.duration_seconds) / 3600 * 100) / 100}小时`;
+	return `${国家标签} - ${记录?.note || 时长名称}`;
 }
 
 const 访问国家代码列表 = Object.freeze(`AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ
