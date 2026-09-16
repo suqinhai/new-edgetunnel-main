@@ -497,15 +497,20 @@ export default {
 								}
 							}).filter(item => item !== null).join('\n');
 						} else { // 订阅转换
-							const 订阅转换URL = `${config_JSON.订阅转换配置.SUBAPI}/sub?target=${订阅类型}&url=${encodeURIComponent(url.protocol + '//' + url.host + '/sub?target=mixed&token=' + 今日订阅转换后端专属TOKEN + '&asOrg=' + 识别运营商(request) + (url.searchParams.has('sub') && url.searchParams.get('sub') != '' ? `&sub=${url.searchParams.get('sub')}` : ''))}&config=${encodeURIComponent(config_JSON.订阅转换配置.SUBCONFIG)}&emoji=${config_JSON.订阅转换配置.SUBEMOJI}&scv=${config_JSON.跳过证书验证}`;
-							try {
-								const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/cmliu/edge' + 'tunnel)' } });
-								if (response.ok) {
-									订阅内容 = await response.text();
-									if (url.searchParams.has('surge') || ua.includes('surge')) 订阅内容 = Surge订阅配置文件热补丁(订阅内容, url.protocol + '//' + url.host + '/sub?token=' + 订阅TOKEN + '&surge', config_JSON);
-								} else return new Response('订阅转换后端异常：' + response.statusText, { status: response.status });
-							} catch (error) {
-								return new Response('订阅转换后端异常：' + error.message, { status: 403 });
+							if (动态访问订阅 && 订阅类型 === 'clash') {
+								// 国家链接只需一个节点和一个选择组，不经过 ACL4SSR 的多组模板。
+								订阅内容 = 生成最简Clash订阅(config_JSON, 访问授权上下文.记录);
+							} else {
+								const 订阅转换URL = `${config_JSON.订阅转换配置.SUBAPI}/sub?target=${订阅类型}&url=${encodeURIComponent(url.protocol + '//' + url.host + '/sub?target=mixed&token=' + 今日订阅转换后端专属TOKEN + '&asOrg=' + 识别运营商(request) + (url.searchParams.has('sub') && url.searchParams.get('sub') != '' ? `&sub=${url.searchParams.get('sub')}` : ''))}&config=${encodeURIComponent(config_JSON.订阅转换配置.SUBCONFIG)}&emoji=${config_JSON.订阅转换配置.SUBEMOJI}&scv=${config_JSON.跳过证书验证}`;
+								try {
+									const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/cmliu/edge' + 'tunnel)' } });
+									if (response.ok) {
+										订阅内容 = await response.text();
+										if (url.searchParams.has('surge') || ua.includes('surge')) 订阅内容 = Surge订阅配置文件热补丁(订阅内容, url.protocol + '//' + url.host + '/sub?token=' + 订阅TOKEN + '&surge', config_JSON);
+									} else return new Response('订阅转换后端异常：' + response.statusText, { status: response.status });
+								} catch (error) {
+									return new Response('订阅转换后端异常：' + error.message, { status: 403 });
+								}
 							}
 						}
 
@@ -531,7 +536,7 @@ export default {
 							订阅内容 = await Singbox订阅配置文件热补丁(订阅内容, config_JSON);
 							responseHeaders["content-type"] = 'application/json; charset=utf-8';
 						} else if (订阅类型 === 'clash') {
-							订阅内容 = Clash订阅配置文件热补丁(订阅内容, config_JSON);
+							if (!动态访问订阅) 订阅内容 = Clash订阅配置文件热补丁(订阅内容, config_JSON);
 							responseHeaders["content-type"] = 'application/x-yaml; charset=utf-8';
 						}
 						return new Response(订阅内容, { status: 200, headers: responseHeaders });
@@ -6258,6 +6263,75 @@ function 获取传输路径参数值(配置 = {}, 节点路径 = '/', 作为优�
 	const 路径值 = 作为优选订阅生成器 ? '/' : (配置.随机路径 ? 随机路径(节点路径) : 节点路径);
 	if (配置.传输协议 !== 'grpc') return 路径值;
 	return 路径值.split('?')[0] || '/';
+}
+
+function 生成最简Clash订阅(config = {}, 记录 = {}) {
+	const 转义 = value => JSON.stringify(String(value ?? ''));
+	const 名称 = 生成访问节点名称(记录);
+	const 组名 = 名称.split(' - ')[0] || 名称;
+	const host = String(config.HOST || '');
+	const uuid = String(config.UUID || 记录.uuid || '');
+	const protocol = String(config.协议类型 || 'vless').toLowerCase();
+	const network = String(config.传输协议 || 'ws').toLowerCase();
+	const 原始路径 = String(config.完整节点路径 || config.PATH || '/');
+	const path = 获取传输路径参数值(config, 原始路径);
+	const insecure = Boolean(config.跳过证书验证);
+	const lines = [
+		'proxies:',
+		`  - name: ${转义(名称)}`,
+		`    type: ${protocol === 'ss' ? 'ss' : protocol === 'trojan' ? 'trojan' : 'vless'}`,
+		`    server: ${转义(host)}`,
+		`    port: ${protocol === 'ss' && config.SS?.TLS === false ? 80 : 443}`,
+	];
+
+	if (protocol === 'ss') {
+		const cipher = String(config.SS?.加密方式 || 'aes-128-gcm');
+		const ssPath = 原始路径.includes('?') ? 原始路径.replace('?', `?enc=${cipher}&`) : `${原始路径}?enc=${cipher}`;
+		lines.push(
+			`    cipher: ${转义(cipher)}`,
+			`    password: ${转义(uuid)}`,
+			'    udp: true',
+			'    plugin: v2ray-plugin',
+			'    plugin-opts:',
+			'      mode: websocket',
+			`      host: ${转义(host)}`,
+			`      path: ${转义(config.随机路径 ? 随机路径(ssPath) : ssPath)}`,
+			`      tls: ${config.SS?.TLS !== false}`,
+		);
+		if (insecure) lines.push('      skip-cert-verify: true');
+	} else {
+		lines.push(
+			protocol === 'trojan' ? `    password: ${转义(uuid)}` : `    uuid: ${转义(uuid)}`,
+			'    udp: true',
+			`    tls: true`,
+			`    servername: ${转义(host)}`,
+		);
+		if (protocol !== 'trojan') lines.push('    encryption: none');
+		if (insecure) lines.push('    skip-cert-verify: true');
+		if (config.Fingerprint) lines.push(`    client-fingerprint: ${转义(config.Fingerprint)}`);
+		if (config.ECH) {
+			lines.push('    ech-opts:', '      enable: true');
+			if (config.ECHConfig?.SNI) lines.push(`      query-server-name: ${转义(config.ECHConfig.SNI)}`);
+		}
+		if (network === 'grpc') {
+			lines.push('    network: grpc', '    grpc-opts:', `      grpc-service-name: ${转义(path)}`);
+			if (config.gRPCUserAgent) lines.push(`      grpc-user-agent: ${转义(config.gRPCUserAgent)}`);
+		} else if (network === 'xhttp') {
+			lines.push('    network: xhttp', '    xhttp-opts:', `      path: ${转义(path)}`, `      host: ${转义(host)}`, '      mode: stream-one');
+		} else {
+			lines.push('    network: ws', '    ws-opts:', `      path: ${转义(path)}`, '      headers:', `        Host: ${转义(host)}`);
+		}
+	}
+
+	lines.push(
+		'proxy-groups:',
+		`  - name: ${转义(组名)}`,
+		'    type: select',
+		`    proxies: [${转义(名称)}]`,
+		'rules:',
+		`  - MATCH,${组名}`,
+	);
+	return lines.join('\n') + '\n';
 }
 
 function log(...args) {

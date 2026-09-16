@@ -36,6 +36,14 @@ function subscriptionRequest(token, extra = '') {
   return request;
 }
 
+function clashSubscriptionRequest(token, extra = '') {
+  const request = new Request('https://worker.example/sub?token=' + token + extra, {
+    headers: { 'User-Agent': 'Clash Verge' }
+  });
+  Object.defineProperty(request, 'cf', { value: { asn: 0, colo: 'TPE' } });
+  return request;
+}
+
 test('伪装页转发移除认证信息并保留普通请求头', async t => {
   const digest = crypto.subtle.digest.bind(crypto.subtle);
   // Cloudflare 支持 MD5；Node 的 Web Crypto 需用等价实现补齐。
@@ -648,6 +656,23 @@ for (const fixedUUID of [false, true]) {
     assert.equal(row.connection_count, 0);
   });
 }
+
+test('Clash 限时订阅使用最简配置，只保留国家节点和选择组', async t => {
+  mockWorkerRuntime(t);
+  const { db, DB } = createDatabase(t);
+  insertLink(db, null, null);
+  const token = 'x'.repeat(43);
+  const response = await worker.fetch(clashSubscriptionRequest(token), { ADMIN: 'test-password', DB }, { waitUntil() {} });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('Content-Type'), /application\/x-yaml/);
+  const yaml = await response.text();
+  assert.match(yaml, /proxies:\n  - name: "台湾 \(TW\) - 1小时"/);
+  assert.match(yaml, /proxy-groups:\n  - name: "台湾 \(TW\)"/);
+  assert.match(yaml, /rules:\n  - MATCH,台湾 \(TW\)/);
+  assert.doesNotMatch(yaml, /全球直连|全球拦截|漏网之鱼|CloudFlareCDN/);
+  assert.doesNotMatch(yaml, /^dns:/m);
+  assert.equal((yaml.match(/^  - name:/gm) || []).length, 2);
+});
 
 test('链式代理备注保留限时订阅的令牌路径，普通订阅仍使用链式代理', async t => {
   mockWorkerRuntime(t);
