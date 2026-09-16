@@ -380,7 +380,10 @@ export default {
 													? 'loon'
 													: 'mixed';
 
-						if (!ua.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(config_JSON.优选订阅生成.SUBNAME)}`;
+						if (!ua.includes('mozilla')) {
+							const 订阅文件名 = 动态访问订阅 ? 生成访问国家时效名称(访问授权上下文.记录) : config_JSON.优选订阅生成.SUBNAME;
+							responseHeaders["Content-Disposition"] = `attachment; filename*=UTF-8''${encodeURIComponent(订阅文件名)}`;
+						}
 						const 协议类型 = ((url.searchParams.has('surge') || ua.includes('surge')) && config_JSON.协议类型 !== 'ss') ? 'tro' + 'jan' : config_JSON.协议类型;
 						let 订阅内容 = '';
 						if (订阅类型 === 'mixed') {
@@ -1263,11 +1266,17 @@ function 生成访问节点链接(config, 记录) {
 }
 
 function 生成访问节点名称(记录) {
+	const 国家时效名称 = 生成访问国家时效名称(记录);
+	if (!记录?.note) return 国家时效名称;
+	return `${国家时效名称.split(' - ')[0]} - ${记录.note}`;
+}
+
+function 生成访问国家时效名称(记录) {
 	const 国家代码 = String(记录?.country || '').trim().toUpperCase();
 	const 国家名称 = 国家代码 ? (访问国家显示名称格式器?.of(国家代码) || 国家代码) : '国家节点';
 	const 国家标签 = 国家代码 && 国家名称 !== 国家代码 ? `${国家名称} (${国家代码})` : 国家名称;
 	const 时长名称 = Number(记录?.duration_seconds) === 0 ? '永久' : `${Math.round(Number(记录?.duration_seconds) / 3600 * 100) / 100}小时`;
-	return `${国家标签} - ${记录?.note || 时长名称}`;
+	return `${国家标签} - ${时长名称}`;
 }
 
 const 访问国家代码列表 = Object.freeze(`AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ
