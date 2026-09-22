@@ -5,6 +5,7 @@ let 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓�
 let 访问数据库初始化任务 = null;
 const 本实例活动访问连接 = new Map();
 const 反代解析缓存 = new Map();
+const IPv4目标解析缓存 = new Map();
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
@@ -12,6 +13,10 @@ const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Mat
 const 上行合包目标字节 = 16 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain静默毫秒 = 0;
 const TCP并发拨号数 = 2;
+
+function 是否启用强制IPv4(env = null) {
+	return ['1', 'true', 'yes', 'on'].includes(String(env?.FORCE_IPV4 ?? '').trim().toLowerCase());
+}
 const ChatGPTCheckout目标主机 = 'chatgpt.com';
 const ChatGPTCheckout目标路径 = '/backend-api/payments/checkout';
 const ChatGPT中继最大正文字节 = 64 * 1024;
@@ -75,7 +80,7 @@ export default {
 		// 旧的订阅生成流程仍读取这两个默认值；实际隧道连接使用下面的请求级快照。
 		反代IP = 请求反代IP;
 		启用反代兜底 = 请求启用反代兜底;
-		let 请求反代上下文 = { 反代IP: 请求反代IP, 启用反代兜底: 请求启用反代兜底, 启用SOCKS5反代: null, 启用SOCKS5全局反代: false, parsedSocks5Address: {} };
+		let 请求反代上下文 = { 反代IP: 请求反代IP, 启用反代兜底: 请求启用反代兜底, 强制IPv4: 是否启用强制IPv4(env), 启用SOCKS5反代: null, 启用SOCKS5全局反代: false, parsedSocks5Address: {} };
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
 		if (缓存SOCKS5白名单 === null) {
 			if (env.GO2SOCKS5) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(await 整理成数组(env.GO2SOCKS5)))];
@@ -1459,6 +1464,7 @@ async function 激活访问授权上下文(上下文) {
 		上下文.反代上下文 = {
 			反代IP: [记录.proxy_ip, ...候选反代IP.filter(item => item !== 记录.proxy_ip)].join(','),
 			启用反代兜底: false,
+			强制IPv4: 是否启用强制IPv4(上下文.env),
 			启用SOCKS5反代: null,
 			启用SOCKS5全局反代: false,
 			parsedSocks5Address: {},
@@ -4196,7 +4202,7 @@ async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 
 function 获取TCP反代配置(请求反代上下文 = null) {
 	if (请求反代上下文) return 请求反代上下文;
-	return { 反代IP, 启用反代兜底, 启用SOCKS5反代, 启用SOCKS5全局反代, parsedSocks5Address };
+	return { 反代IP, 启用反代兜底, 强制IPv4: false, 启用SOCKS5反代, 启用SOCKS5全局反代, parsedSocks5Address };
 }
 
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null, 请求反代上下文 = null) {
@@ -4207,7 +4213,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const 当前启用SOCKS5全局反代 = 当前反代配置.启用SOCKS5全局反代;
 	const 当前parsedSocks5Address = 当前反代配置.parsedSocks5Address || {};
 	const 当前访问授权上下文 = 当前反代配置.访问授权上下文 || null;
-	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${当前反代IP} | 反代兜底: ${当前启用反代兜底 ? '是' : '否'} | 反代类型: ${当前启用SOCKS5反代 || 'proxyip'} | 全局: ${当前启用SOCKS5全局反代 ? '是' : '否'}`);
+	const 强制使用IPv4 = 当前反代配置.强制IPv4 === true || 是否启用强制IPv4(当前访问授权上下文?.env);
+	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${当前反代IP} | 反代兜底: ${当前启用反代兜底 ? '是' : '否'} | 强制IPv4: ${强制使用IPv4 ? '是' : '否'} | 反代类型: ${当前启用SOCKS5反代 || 'proxyip'} | 全局: ${当前启用SOCKS5全局反代 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
 	let 已通过代理发送首包 = false;
 	const TCP连接 = 创建请求TCP连接器(request, remoteConnWrapper);
@@ -4282,13 +4289,19 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 	async function connectDirect(address, port, data = null, 所有反代数组 = null, 反代兜底 = true) {
 		if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
-		if (所有反代数组 && 所有反代数组.length > 0) {
-			for (let i = 0; i < 所有反代数组.length; i += TCP并发拨号数) {
+		const 可用反代数组 = 强制使用IPv4
+			? (所有反代数组 || []).filter(([反代地址]) => isIPv4(stripIPv6Brackets(反代地址)))
+			: (所有反代数组 || []);
+		if (强制使用IPv4 && 所有反代数组 && 所有反代数组.length > 0 && !可用反代数组.length) {
+			throw new Error('FORCE_IPV4 已启用，但反代地址没有可用的 IPv4 地址');
+		}
+		if (可用反代数组.length > 0) {
+			for (let i = 0; i < 可用反代数组.length; i += TCP并发拨号数) {
 				if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
 				const 候选列表 = [];
-				for (let j = 0; j < TCP并发拨号数 && i + j < 所有反代数组.length; j++) {
-					const 反代数组索引 = (缓存反代数组索引 + i + j) % 所有反代数组.length;
-					const [反代地址, 反代端口] = 所有反代数组[反代数组索引];
+				for (let j = 0; j < TCP并发拨号数 && i + j < 可用反代数组.length; j++) {
+					const 反代数组索引 = (缓存反代数组索引 + i + j) % 可用反代数组.length;
+					const [反代地址, 反代端口] = 可用反代数组[反代数组索引];
 					候选列表.push({ hostname: 反代地址, port: 反代端口, index: 反代数组索引 });
 				}
 				let socket = null, candidate = null;
@@ -4308,6 +4321,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			}
 		}
 
+		if (强制使用IPv4 && (!所有反代数组 || !所有反代数组.length)) {
+			throw new Error('FORCE_IPV4 已启用，但没有可用的 IPv4 连接候选');
+		}
 		if (反代兜底) {
 			const 候选列表 = Array.from({ length: TCP并发拨号数 }, (_, attempt) => ({ hostname: address, port, attempt }));
 			log(`[TCP直连] 并发尝试 ${候选列表.length} 路: ${address}:${port}`);
@@ -4401,10 +4417,25 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			log(`[TCP转发] SOCKS5/HTTP/HTTPS/TURN/SSTP 代理连接失败: ${err.message}`);
 			throw err;
 		}
+	} else if (强制使用IPv4 && 当前反代IP && !当前启用反代兜底) {
+		// 显式配置 PROXYIP 时，严格先走反代，避免直连目标时被 Cloudflare/系统选到 IPv6。
+		try {
+			await connecttoPry();
+		} catch (err) {
+			log(`[TCP转发] 强制IPv4反代连接失败: ${err.message}`);
+			throw err;
+		}
 	} else {
 		try {
 			log(`[TCP转发] 尝试直连到: ${host}:${portNum}`);
-			const initialSocket = await connectDirect(host, portNum, rawData);
+			let initialSocket;
+			if (强制使用IPv4) {
+				const IPv4地址 = await 获取IPv4目标地址(host);
+				if (!IPv4地址.length) throw new Error(`FORCE_IPV4 已启用，但 ${host} 没有可用的 A 记录`);
+				initialSocket = await connectDirect(host, portNum, rawData, IPv4地址.map(ip => [ip, portNum]), false);
+			} else {
+				initialSocket = await connectDirect(host, portNum, rawData);
+			}
 			if (ws.readyState !== WebSocket.OPEN) { try { initialSocket.close() } catch (_) { } return; }
 			if (当前访问授权上下文) 当前访问授权上下文.代理连接成功 = true;
 			remoteConnWrapper.socket = initialSocket;
@@ -5847,6 +5878,22 @@ async function withTimeout(promise, timeoutMs, message) {
 function isIPv4(value) {
 	const parts = String(value || '').split('.');
 	return parts.length === 4 && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+}
+
+async function 获取IPv4目标地址(hostname) {
+	const host = stripIPv6Brackets(hostname);
+	if (isIPv4(host)) return [host];
+	if (!host || isIPHostname(host)) return [];
+	const cacheKey = host.toLowerCase();
+	if (IPv4目标解析缓存.has(cacheKey)) return IPv4目标解析缓存.get(cacheKey);
+	let addresses = [];
+	try {
+		const records = await DoH查询(host, 'A');
+		addresses = [...new Set((records || []).filter(record => record.type === 1 && isIPv4(record.data)).map(record => record.data))];
+	} catch (_) { }
+	if (IPv4目标解析缓存.size >= 64) IPv4目标解析缓存.delete(IPv4目标解析缓存.keys().next().value);
+	IPv4目标解析缓存.set(cacheKey, addresses);
+	return addresses;
 }
 
 function turnStunPadding(length) {
@@ -7977,6 +8024,7 @@ async function 反代参数获取(url, uuid, 初始反代上下文 = {}) {
 	const pathname = decodeURIComponent(url.pathname);
 	let 本次反代IP = 初始反代上下文.反代IP ?? 反代IP;
 	let 本次启用反代兜底 = 初始反代上下文.启用反代兜底 ?? 启用反代兜底;
+	let 本次强制IPv4 = 初始反代上下文.强制IPv4 ?? false;
 	let 本次启用SOCKS5反代 = null;
 	let 本次启用SOCKS5全局反代 = searchParams.has('globalproxy');
 	let 本次SOCKS5账号 = searchParams.get('socks5') || searchParams.get('http') || searchParams.get('https') || searchParams.get('turn') || searchParams.get('sstp') || null;
@@ -7984,6 +8032,7 @@ async function 反代参数获取(url, uuid, 初始反代上下文 = {}) {
 	const 构建反代上下文 = () => ({
 		反代IP: 本次反代IP,
 		启用反代兜底: 本次启用反代兜底,
+		强制IPv4: 本次强制IPv4,
 		启用SOCKS5反代: 本次启用SOCKS5反代,
 		启用SOCKS5全局反代: 本次启用SOCKS5全局反代,
 		parsedSocks5Address: 本次代理地址
@@ -7999,6 +8048,7 @@ async function 反代参数获取(url, uuid, 初始反代上下文 = {}) {
 			const 链式代理配置 = {
 				反代IP: '链式代理',
 				启用反代兜底: false,
+				强制IPv4: 初始反代上下文.强制IPv4 ?? false,
 				启用SOCKS5全局反代: true,
 				启用SOCKS5反代: String(type).toLowerCase(),
 				parsedSocks5Address: {

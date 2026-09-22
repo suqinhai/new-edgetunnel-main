@@ -211,6 +211,36 @@ for (const afterData of [false, true]) {
   });
 }
 
+test('FORCE_IPV4 配置的 PROXYIP 会优先使用 IPv4 反代入口', async t => {
+  const sockets = [];
+  const bridge = { readyState: WebSocket.OPEN, send() {}, close() { this.readyState = WebSocket.CLOSED; } };
+  const request = {
+    fetcher: {
+      connect(options) {
+        const socket = {
+          ...options,
+          opened: Promise.resolve(),
+          closed: new Promise(() => {}),
+          readable: new ReadableStream(),
+          writable: new WritableStream(),
+          close() {}
+        };
+        sockets.push(socket);
+        return socket;
+      }
+    }
+  };
+  t.after(() => bridge.close());
+  await __test.forwardataTCP('target.example', 443, Uint8Array.of(1), bridge, null, {}, uuid, request, {
+    反代IP: '203.0.113.11,[2001:db8::1]',
+    启用反代兜底: false,
+    强制IPv4: true,
+    启用SOCKS5反代: null
+  });
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].hostname, '203.0.113.11');
+});
+
 test('两个并发续期请求都累加到实际到期时间', async t => {
   const { db, DB } = createDatabase(t);
   const expiry = Date.now() + 3600000;
