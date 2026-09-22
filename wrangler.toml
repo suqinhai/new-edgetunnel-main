@@ -10,11 +10,11 @@ crons = ["*/15 * * * *"]
 #binding = "KV"			#KV绑定名默认不可修改
 #id = ""				#KV数据库id
 
-#[[d1_databases]]
-#binding = "DB"			#限时访问链接数据库绑定名，不可修改
-#database_name = "edgetunnel-access"
-#database_id = ""
-#migrations_dir = "migrations"
+[[d1_databases]]
+binding = "DB"			#限时访问链接数据库绑定名，不可修改
+database_name = "edgetunnel-access"
+database_id = "e94fc327-e97a-485b-818e-88b9c66f97021748992"
+migrations_dir = "migrations"
 
 # ADMIN 请使用 `npx wrangler secret put ADMIN` 设置，不要把真实密码写入本文件。
 # 以下均为可选调优变量；取消注释 [vars] 后按需启用。
