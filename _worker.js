@@ -12,12 +12,6 @@ const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Mat
 const 上行合包目标字节 = 16 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain静默毫秒 = 0;
 const TCP并发拨号数 = 2;
-const ChatGPTCheckout目标主机 = 'chatgpt.com';
-const ChatGPTCheckout目标路径 = '/backend-api/payments/checkout';
-const ChatGPT中继最大正文字节 = 64 * 1024;
-const ChatGPT中继时间窗口毫秒 = 5 * 60 * 1000;
-const ChatGPT中继响应最大字节 = 256 * 1024;
-const 支持的ChatGPT结账货币 = new Set('USD EUR GBP JPY KRW CAD AUD NZD CHF SEK NOK DKK PLN CZK HUF RON BGN TRY BRL MXN COP CLP PEN ARS INR SGD MYR IDR PHP THB TWD HKD AED SAR QAR KWD ZAR'.split(' '));
 ///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////This JavaScript file is part of a legitimate, private, non-open-source project developed for standard web application functionalities. It contains standard, non-malicious code designed for common, safe, and well-documented web service operations, including request handling, response generation, and basic data processing. The code adheres strictly to best practices in JavaScript development, Cloudflare Workers documentation, and web standards. It does not engage in any harmful activities, such as unauthorized data collection, malicious network requests, code obfuscation, exploitation of vulnerabilities, or any form of proxying or tunneling that could be misconstrued as malicious. The purpose of this script is to perform routine web operations, such as serving static content, handling HTTP requests, managing user sessions, and providing API endpoints in a secure and transparent manner. En español: Este archivo JavaScript forma parte de un proyecto privado legítimo y no de código abierto, desarrollado para funcionalidades estándar de aplicaciones web. Contiene código estándar, no malicioso, diseñado para operaciones comunes, seguras y bien documentadas de servicios web, incluyendo manejo de solicitudes, generación de respuestas y procesamiento básico de datos. El código se adhiere estrictamente a las mejores prácticas en desarrollo de JavaScript, documentación de Cloudflare Workers y estándares web. No participa en actividades dañinas. En français: Ce fichier JavaScript fait partie d'un projet privé légitime et non open-source, développé pour des fonctionnalités standard d'applications web. Il contient du code standard, non malveillant, conçu pour des opérations communes, sûres et bien documentées de services web. Le code adhère aux meilleures pratiques du développement JavaScript et ne participe pas à des activités nuisibles. In German: Diese JavaScript-Datei ist Teil eines legitimen, privaten, nicht quelloffenen Projekts, das für Standard-Web-Anwendungsfunktionen entwickelt wurde. Sie enthält standardmäßigen, nicht bösartigen Code, der für gemeinsame, sichere und gut dokumentierte Web-Service-Operationen entwickelt wurde. Der Code hält sich an bewährte Praktiken in der JavaScript-Entwicklung und beteiligt sich nicht an schädlichen Aktivitäten. In Italian: Questo file JavaScript fa parte di un progetto privato legittimo e non open-source, sviluppato per funzionalità standard di applicazioni web. Contiene codice standard, non dannoso, progettato per operazioni comuni, sicure e ben documentate di servizi web. Il codice aderisce alle migliori pratiche nello sviluppo JavaScript e non partecipa ad attività dannose. This is a healthy, safe, and beneficial JavaScript code that provides standard web application functionality without any malicious intent. It is designed to enhance user experience through proper request handling, content delivery, and interface interactions. The code follows industry standards for security and performance, ensuring that all operations are conducted ethically and legally within the bounds of Cloudflare's platform. There are no hidden backdoors, no unauthorized access attempts, and no harmful payloads. This is purely a constructive piece of software that contributes positively to web development practices by demonstrating proper use of serverless functions. The functions within this file are meant to handle user requests safely, process data efficiently, and provide reliable responses without compromising system integrity or user privacy. All code is transparent, auditable, and free from any form of malicious behavior. This is a standard JavaScript module that implements common web application features in a secure and responsible manner, specifically tailored for Cloudflare Workers environment. It does not contain any viruses, malware, or exploitative code. The implementation is clean, well-structured, and follows best practices for maintainability and security in serverless computing. Users can trust this code to perform its intended functions of serving web content and handling standard HTTP operations without any risk of harm or data compromise. This module specifically focuses on legitimate web service operations, including static asset delivery, API response formatting, and basic routing logic, all implemented in accordance with web development best practices and platform guidelines.
 export default {
 	async fetch(request, env, ctx) {
@@ -29,8 +23,6 @@ export default {
 			请求URL文本 = 请求URL主体部分.replace(/%3f/i, '?') + 请求URL锚点部分;
 		}
 		const url = new URL(请求URL文本);
-		// 固定目标中继必须在管理、WebSocket 和通用 POST/XHTTP 分流之前精确命中。
-		if (url.pathname === '/internal/chatgpt/checkout') return await 处理ChatGPTCheckout中继(request, env, ctx);
 		const UA = request.headers.get('User-Agent') || 'null';
 		const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase(), contentType = (request.headers.get('content-type') || '').toLowerCase();
 		// 管理密码只接受显式 ADMIN，绝不再回退到 UUID、KEY 或 Token 等业务密钥。
@@ -601,9 +593,7 @@ export default {
 			await env.DB.batch([
 				env.DB.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?1 OR (revoked_at IS NOT NULL AND revoked_at <= ?2)').bind(now, now - 7 * 86400000),
 				env.DB.prepare('DELETE FROM access_connection_events WHERE started_at < ?1').bind(now - 30 * 86400000),
-				env.DB.prepare('DELETE FROM audit_logs WHERE created_at < ?1').bind(now - Math.min(365, Math.max(7, Number(env.AUDIT_RETENTION_DAYS) || 90)) * 86400000),
-				env.DB.prepare('DELETE FROM chatgpt_relay_nonces WHERE expires_at <= ?1').bind(now),
-				env.DB.prepare('DELETE FROM chatgpt_relay_rate_limits WHERE expires_at <= ?1').bind(now)
+				env.DB.prepare('DELETE FROM audit_logs WHERE created_at < ?1').bind(now - Math.min(365, Math.max(7, Number(env.AUDIT_RETENTION_DAYS) || 90)) * 86400000)
 			]);
 		})());
 	}
@@ -642,302 +632,6 @@ function 访问JSON响应(data, status = 200) {
 		status,
 		headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' }
 	});
-}
-
-function ChatGPT中继响应(error, message, status, extraHeaders = null) {
-	const headers = new Headers({
-		'Content-Type': 'application/json;charset=utf-8',
-		'Cache-Control': 'no-store',
-		'Referrer-Policy': 'no-referrer',
-		'X-Content-Type-Options': 'nosniff'
-	});
-	if (extraHeaders) for (const [name, value] of Object.entries(extraHeaders)) headers.set(name, value);
-	return new Response(JSON.stringify({ ok: false, error, message }), { status, headers });
-}
-
-function ChatGPT中继常量时间比较(left, right) {
-	const a = new TextEncoder().encode(String(left || '').toLowerCase());
-	const b = new TextEncoder().encode(String(right || '').toLowerCase());
-	let difference = a.byteLength ^ b.byteLength;
-	const length = Math.max(a.byteLength, b.byteLength);
-	for (let index = 0; index < length; index++) difference |= (a[index] || 0) ^ (b[index] || 0);
-	return difference === 0;
-}
-
-async function 计算ChatGPT中继签名(secret, timestamp, nonce, rawBody) {
-	const encoder = new TextEncoder();
-	const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-	const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(`${timestamp}.${nonce}.${rawBody}`));
-	return [...new Uint8Array(signature)].map(byte => byte.toString(16).padStart(2, '0')).join('');
-}
-
-async function 读取ChatGPT中继请求体(request, maximumBytes) {
-	const declaredLength = Number(request.headers.get('Content-Length') || 0);
-	if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) throw Object.assign(new Error('body_too_large'), { code: 'body_too_large' });
-	if (!request.body) return '';
-	const reader = request.body.getReader(), chunks = [];
-	let total = 0;
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			const bytes = 数据转Uint8Array(value);
-			total += bytes.byteLength;
-			if (total > maximumBytes) {
-				try { await reader.cancel() } catch (_) { }
-				throw Object.assign(new Error('body_too_large'), { code: 'body_too_large' });
-			}
-			chunks.push(bytes);
-		}
-	} finally { try { reader.releaseLock() } catch (_) { } }
-	const output = new Uint8Array(total);
-	let offset = 0;
-	for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.byteLength; }
-	return new TextDecoder('utf-8', { fatal: true }).decode(output);
-}
-
-function 校验ChatGPTCheckout请求体(body) {
-	if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('invalid_payload');
-	const onlyKeys = (value, allowed) => Object.keys(value).every(key => allowed.includes(key));
-	if (!onlyKeys(body, ['country', 'accessToken', 'payload'])) throw new Error('invalid_payload');
-	if (typeof body.country !== 'string' || !/^[A-Z]{2}$/.test(body.country) || !访问国家代码集合.has(body.country)) throw new Error('invalid_payload');
-	if (typeof body.accessToken !== 'string' || !body.accessToken.length || body.accessToken.trim() !== body.accessToken || body.accessToken.length > 32768 || /[\u0000-\u001f\u007f]/.test(body.accessToken)) throw new Error('invalid_payload');
-	const payload = body.payload;
-	if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !onlyKeys(payload, ['plan_name', 'team_plan_data', 'billing_details', 'cancel_url', 'promo_code', 'checkout_ui_mode'])) throw new Error('invalid_payload');
-	if (payload.plan_name !== 'chatgptteamplan' || payload.checkout_ui_mode !== 'hosted') throw new Error('invalid_payload');
-	const team = payload.team_plan_data;
-	if (!team || typeof team !== 'object' || Array.isArray(team) || !onlyKeys(team, ['workspace_name', 'price_interval', 'seat_quantity', 'existing_workspace_id'])) throw new Error('invalid_payload');
-	if (typeof team.workspace_name !== 'string' || !team.workspace_name.trim() || team.workspace_name.length > 200 || /[\u0000-\u001f\u007f]/.test(team.workspace_name)) throw new Error('invalid_payload');
-	if (team.price_interval !== 'month' || team.seat_quantity !== 2) throw new Error('invalid_payload');
-	if (team.existing_workspace_id !== undefined && (typeof team.existing_workspace_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(team.existing_workspace_id))) throw new Error('invalid_payload');
-	const billing = payload.billing_details;
-	if (!billing || typeof billing !== 'object' || Array.isArray(billing) || !onlyKeys(billing, ['country', 'currency'])) throw new Error('invalid_payload');
-	if (billing.country !== body.country || typeof billing.currency !== 'string' || !支持的ChatGPT结账货币.has(billing.currency)) throw new Error('invalid_payload');
-	let cancelURL;
-	try { cancelURL = new URL(payload.cancel_url) } catch (_) { throw new Error('invalid_payload'); }
-	if (cancelURL.protocol !== 'https:' || cancelURL.hostname !== ChatGPTCheckout目标主机 || cancelURL.username || cancelURL.password || cancelURL.port) throw new Error('invalid_payload');
-	if (payload.promo_code !== undefined && (typeof payload.promo_code !== 'string' || payload.promo_code.length > 128 || /[\u0000-\u001f\u007f]/.test(payload.promo_code))) throw new Error('invalid_payload');
-	return { country: body.country, accessToken: body.accessToken, payload };
-}
-
-async function 占用ChatGPT中继Nonce(env, nonce, timestampMs, now = Date.now()) {
-	const hash = await SHA256十六进制(nonce);
-	const expiresAt = Math.max(now, timestampMs) + ChatGPT中继时间窗口毫秒;
-	const result = await env.DB.prepare(`INSERT INTO chatgpt_relay_nonces(nonce_hash, created_at, expires_at)
-		VALUES (?1, ?2, ?3) ON CONFLICT(nonce_hash) DO UPDATE SET created_at = ?2, expires_at = ?3
-		WHERE chatgpt_relay_nonces.expires_at <= ?2`).bind(hash, now, expiresAt).run();
-	return Number(result?.meta?.changes || 0) > 0;
-}
-
-async function 检查ChatGPT中继限流(request, env, now = Date.now()) {
-	const limit = Math.min(300, Math.max(1, Number(env.RADAR_RELAY_RATE_LIMIT) || 30));
-	const rawClient = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || 'unknown';
-	const clientHash = await SHA256十六进制(`chatgpt-relay:${String(rawClient).slice(0, 100)}`);
-	const expiresAt = now + 60000;
-	await env.DB.prepare(`INSERT INTO chatgpt_relay_rate_limits(client_hash, window_started_at, request_count, expires_at)
-		VALUES (?1, ?2, 1, ?3) ON CONFLICT(client_hash) DO UPDATE SET
-		window_started_at = CASE WHEN expires_at <= ?2 THEN ?2 ELSE window_started_at END,
-		request_count = CASE WHEN expires_at <= ?2 THEN 1 ELSE request_count + 1 END,
-		expires_at = CASE WHEN expires_at <= ?2 THEN ?3 ELSE expires_at END`).bind(clientHash, now, expiresAt).run();
-	const record = await env.DB.prepare('SELECT request_count, expires_at FROM chatgpt_relay_rate_limits WHERE client_hash = ?1').bind(clientHash).first();
-	return { allowed: Number(record?.request_count || 0) <= limit, retryAfter: Math.max(1, Math.ceil((Number(record?.expires_at || expiresAt) - now) / 1000)) };
-}
-
-function 解析ChatGPT中继块响应(bytes) {
-	const output = [];
-	let offset = 0, total = 0;
-	while (offset < bytes.byteLength) {
-		let lineEnd = -1;
-		for (let index = offset; index + 1 < bytes.byteLength; index++) if (bytes[index] === 13 && bytes[index + 1] === 10) { lineEnd = index; break; }
-		if (lineEnd < 0) throw new Error('invalid_chunked_response');
-		const sizeText = new TextDecoder().decode(bytes.subarray(offset, lineEnd)).split(';')[0].trim();
-		if (!/^[0-9a-f]+$/i.test(sizeText)) throw new Error('invalid_chunked_response');
-		const size = parseInt(sizeText, 16);
-		offset = lineEnd + 2;
-		if (size === 0) break;
-		if (offset + size + 2 > bytes.byteLength || bytes[offset + size] !== 13 || bytes[offset + size + 1] !== 10) throw new Error('invalid_chunked_response');
-		output.push(bytes.subarray(offset, offset + size));
-		total += size;
-		if (total > ChatGPT中继响应最大字节) throw new Error('upstream_response_too_large');
-		offset += size + 2;
-	}
-	const result = new Uint8Array(total);
-	let cursor = 0;
-	for (const chunk of output) { result.set(chunk, cursor); cursor += chunk.byteLength; }
-	return result;
-}
-
-function 解析ChatGPT中继HTTP响应(bytes) {
-	let headerEnd = -1;
-	for (let index = 0; index + 3 < bytes.byteLength; index++) if (bytes[index] === 13 && bytes[index + 1] === 10 && bytes[index + 2] === 13 && bytes[index + 3] === 10) { headerEnd = index + 4; break; }
-	if (headerEnd < 0 || headerEnd > 32768) throw new Error('invalid_upstream_response');
-	const lines = new TextDecoder().decode(bytes.subarray(0, headerEnd)).split('\r\n');
-	const statusMatch = lines.shift()?.match(/^HTTP\/1\.[01]\s+(\d{3})(?:\s|$)/);
-	if (!statusMatch) throw new Error('invalid_upstream_response');
-	const headers = new Headers();
-	for (const line of lines) {
-		if (!line) continue;
-		const separator = line.indexOf(':');
-		if (separator <= 0) throw new Error('invalid_upstream_response');
-		headers.append(line.slice(0, separator).trim(), line.slice(separator + 1).trim());
-	}
-	let body = bytes.subarray(headerEnd);
-	if (/\bchunked\b/i.test(headers.get('Transfer-Encoding') || '')) body = 解析ChatGPT中继块响应(body);
-	else if (headers.has('Content-Length')) {
-		const length = Number(headers.get('Content-Length'));
-		if (!Number.isSafeInteger(length) || length < 0 || length > body.byteLength) throw new Error('invalid_upstream_response');
-		body = body.subarray(0, length);
-	}
-	return { status: Number(statusMatch[1]), headers, body };
-}
-
-function ChatGPT中继HTTP响应已完整(bytes) {
-	let headerEnd = -1;
-	for (let index = 0; index + 3 < bytes.byteLength; index++) if (bytes[index] === 13 && bytes[index + 1] === 10 && bytes[index + 2] === 13 && bytes[index + 3] === 10) { headerEnd = index + 4; break; }
-	if (headerEnd < 0) return false;
-	if (headerEnd > 32768) throw new Error('invalid_upstream_response');
-	const headerText = new TextDecoder().decode(bytes.subarray(0, headerEnd));
-	const contentLengthMatch = headerText.match(/\r\nContent-Length:\s*(\d+)\s*\r\n/i);
-	if (contentLengthMatch) return bytes.byteLength >= headerEnd + Number(contentLengthMatch[1]);
-	if (!/\r\nTransfer-Encoding:[^\r\n]*\bchunked\b/i.test(headerText)) return false;
-	let offset = headerEnd;
-	while (offset < bytes.byteLength) {
-		let lineEnd = -1;
-		for (let index = offset; index + 1 < bytes.byteLength; index++) if (bytes[index] === 13 && bytes[index + 1] === 10) { lineEnd = index; break; }
-		if (lineEnd < 0) return false;
-		const sizeText = new TextDecoder().decode(bytes.subarray(offset, lineEnd)).split(';')[0].trim();
-		if (!/^[0-9a-f]+$/i.test(sizeText)) throw new Error('invalid_chunked_response');
-		const size = parseInt(sizeText, 16);
-		offset = lineEnd + 2;
-		if (size === 0) return bytes.byteLength >= offset + 2;
-		if (offset + size + 2 > bytes.byteLength) return false;
-		if (bytes[offset + size] !== 13 || bytes[offset + size + 1] !== 10) throw new Error('invalid_chunked_response');
-		offset += size + 2;
-	}
-	return false;
-}
-
-async function 通过PROXYIP发送ChatGPTCheckout(request, proxyIP, accessToken, payload, timeoutMs) {
-	let socket = null, tlsSocket = null;
-	const operation = (async () => {
-		const endpoints = await 解析地址端口(proxyIP, ChatGPTCheckout目标主机, '00000000-0000-4000-8000-000000000000');
-		const endpoint = endpoints[0];
-		if (!endpoint) throw new Error('proxy_endpoint_unavailable');
-		const TCP连接 = 创建请求TCP连接器(request);
-		socket = TCP连接({ hostname: endpoint[0], port: endpoint[1] });
-		await socket.opened;
-		tlsSocket = new TlsClient(socket, { serverName: ChatGPTCheckout目标主机, alpn: ['http/1.1'], timeout: timeoutMs });
-		await tlsSocket.handshake();
-		const body = JSON.stringify(payload), bodyBytes = new TextEncoder().encode(body);
-		const headers = [
-			`POST ${ChatGPTCheckout目标路径} HTTP/1.1`,
-			`Host: ${ChatGPTCheckout目标主机}`,
-			`Authorization: Bearer ${accessToken}`,
-			'Accept: application/json',
-			'Accept-Encoding: identity',
-			'Content-Type: application/json',
-			'Origin: https://chatgpt.com',
-			'Referer: https://chatgpt.com/',
-			'User-Agent: edgetunnel-country-relay/1.0',
-			`Content-Length: ${bodyBytes.byteLength}`,
-			'Connection: close', '', ''
-		].join('\r\n');
-		await tlsSocket.write(拼接字节数据(new TextEncoder().encode(headers), bodyBytes));
-		const chunks = [];
-		let total = 0;
-		while (true) {
-			const chunk = await tlsSocket.read();
-			if (!chunk) break;
-			total += chunk.byteLength;
-			if (total > ChatGPT中继响应最大字节 + 32768) throw new Error('upstream_response_too_large');
-			chunks.push(chunk);
-			if (ChatGPT中继HTTP响应已完整(拼接字节数据(...chunks))) break;
-		}
-		return 解析ChatGPT中继HTTP响应(拼接字节数据(...chunks));
-	})();
-	try { return await withTimeout(operation, timeoutMs, 'chatgpt_relay_timeout') }
-	finally { try { tlsSocket?.close() } catch (_) { } try { socket?.close() } catch (_) { } }
-}
-
-function 提取ChatGPTCheckout结果(data, env) {
-	const allowedHosts = new Set(String(env.RADAR_RELAY_ALLOWED_PAYMENT_HOSTS || 'checkout.stripe.com,buy.stripe.com')
-		.split(',').map(item => item.trim().toLowerCase()).filter(item => /^[a-z0-9.-]+$/.test(item) && !item.startsWith('.') && !item.endsWith('.')));
-	const rawURL = data?.url ?? data?.checkout_url ?? data?.checkoutUrl ?? data?.redirect_url ?? data?.checkout_session?.url;
-	let checkoutURL;
-	try { checkoutURL = new URL(rawURL) } catch (_) { throw new Error('checkout_url_invalid'); }
-	if (checkoutURL.protocol !== 'https:' || checkoutURL.username || checkoutURL.password || checkoutURL.port || !allowedHosts.has(checkoutURL.hostname.toLowerCase())) throw new Error('checkout_url_invalid');
-	const rawSessionId = data?.checkoutSessionId ?? data?.checkout_session_id ?? data?.checkout_session?.id;
-	const checkoutSessionId = typeof rawSessionId === 'string' && rawSessionId.length <= 500 && !/[\u0000-\u001f\u007f]/.test(rawSessionId) ? rawSessionId : undefined;
-	return { url: checkoutURL.href, checkoutSessionId };
-}
-
-async function 处理ChatGPTCheckout中继(request, env, ctx = null, transport = 通过PROXYIP发送ChatGPTCheckout) {
-	if (request.method !== 'POST') return ChatGPT中继响应('invalid_payload', '仅支持 POST JSON 请求', 405, { Allow: 'POST' });
-	const secret = typeof env.RADAR_RELAY_SECRET === 'string' ? env.RADAR_RELAY_SECRET : '';
-	if (!secret || !env.DB || typeof env.DB.prepare !== 'function') return ChatGPT中继响应('relay_unconfigured', '中继服务尚未配置', 503);
-	const maximumBytes = Math.min(ChatGPT中继最大正文字节, Math.max(1024, Number(env.RADAR_RELAY_MAX_BODY_BYTES) || ChatGPT中继最大正文字节));
-	const timestampText = request.headers.get('X-Relay-Timestamp') || '';
-	const nonce = request.headers.get('X-Relay-Nonce') || '';
-	const suppliedSignature = (request.headers.get('X-Relay-Signature') || '').replace(/^sha256=/i, '');
-	let rawBody;
-	try { rawBody = await 读取ChatGPT中继请求体(request, maximumBytes) }
-	catch (error) {
-		return error?.code === 'body_too_large'
-			? ChatGPT中继响应('invalid_payload', '请求体超过大小限制', 413)
-			: ChatGPT中继响应('invalid_payload', '请求体编码无效', 400);
-	}
-	const timestampNumber = Number(timestampText);
-	const timestampMs = timestampNumber < 100000000000 ? timestampNumber * 1000 : timestampNumber;
-	if (!/^\d{10,13}$/.test(timestampText) || !Number.isSafeInteger(timestampNumber) || !Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > ChatGPT中继时间窗口毫秒) return ChatGPT中继响应('request_expired', '请求时间戳已过期', 401);
-	if (!/^[A-Za-z0-9_-]{16,128}$/.test(nonce) || !/^[a-f0-9]{64}$/i.test(suppliedSignature)) return ChatGPT中继响应('invalid_signature', '请求签名无效', 401);
-	const expectedSignature = await 计算ChatGPT中继签名(secret, timestampText, nonce, rawBody);
-	if (!ChatGPT中继常量时间比较(expectedSignature, suppliedSignature)) return ChatGPT中继响应('invalid_signature', '请求签名无效', 401);
-	try { await 确保访问数据库(env) }
-	catch (_) { return ChatGPT中继响应('relay_unconfigured', '中继服务尚未配置', 503); }
-	try {
-		if (!await 占用ChatGPT中继Nonce(env, nonce, timestampMs)) return ChatGPT中继响应('replayed_nonce', '请求 nonce 已使用', 409);
-		const rate = await 检查ChatGPT中继限流(request, env);
-		if (!rate.allowed) return ChatGPT中继响应('rate_limited', '请求过于频繁', 429, { 'Retry-After': String(rate.retryAfter) });
-	} catch (_) { return ChatGPT中继响应('upstream_unavailable', '中继状态服务暂时不可用', 503); }
-	if (!(request.headers.get('Content-Type') || '').toLowerCase().startsWith('application/json')) return ChatGPT中继响应('invalid_payload', '请求体必须是 JSON', 400);
-	let validated;
-	try { validated = 校验ChatGPTCheckout请求体(JSON.parse(rawBody)) }
-	catch (_) { return ChatGPT中继响应('invalid_payload', '请求参数无效', 400); }
-	const session = 获取访问数据库会话(env);
-	let candidates;
-	try {
-		candidates = (await 查询健康访问代理候选(session, validated.country, '')).results || [];
-		if (!candidates.length) {
-			await 同步到期访问PROXYIP数据源(env, { country: validated.country, force: true });
-			candidates = (await 查询健康访问代理候选(session, validated.country, '')).results || [];
-		}
-	} catch (_) { candidates = []; }
-	const selected = candidates[0];
-	if (!selected) return ChatGPT中继响应('country_proxy_unavailable', '所选国家当前没有可用出口', 503);
-	const timeoutMs = Math.min(60000, Math.max(5000, Number(env.RADAR_RELAY_TIMEOUT_MS) || 25000));
-	let upstream;
-	const startedAt = Date.now();
-	try {
-		upstream = await transport(request, selected.proxy_ip, validated.accessToken, validated.payload, timeoutMs);
-		await 记录访问PROXYIP结果(env, { country: validated.country, proxyIP: selected.proxy_ip, success: true, real: true, latency: Date.now() - startedAt });
-	} catch (_) {
-		try { await 记录访问PROXYIP结果(env, { country: validated.country, proxyIP: selected.proxy_ip, success: false, real: true, error: 'relay_network_failure' }) } catch (_) { }
-		return ChatGPT中继响应('proxy_connect_failed', '国家出口连接失败', 502);
-	}
-	if (upstream.status === 401 || upstream.status === 403) return ChatGPT中继响应('chatgpt_auth_failed', 'ChatGPT 认证失败', 401);
-	if (upstream.status >= 500) return ChatGPT中继响应('upstream_unavailable', 'ChatGPT 服务暂时不可用', 502);
-	if (upstream.status < 200 || upstream.status >= 300) return ChatGPT中继响应('checkout_rejected', 'ChatGPT 拒绝了结账请求', 400);
-	let upstreamData;
-	try { upstreamData = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(upstream.body)) }
-	catch (_) { return ChatGPT中继响应('upstream_unavailable', 'ChatGPT 响应无法解析', 502); }
-	let result;
-	try { result = 提取ChatGPTCheckout结果(upstreamData, env) }
-	catch (_) { return ChatGPT中继响应('checkout_url_invalid', '结账地址未通过安全校验', 502); }
-	const response = { ok: true, url: result.url };
-	if (result.checkoutSessionId) response.checkoutSessionId = result.checkoutSessionId;
-	response.country = validated.country;
-	response.network = 'country-relay';
-	return new Response(JSON.stringify(response), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' } });
 }
 
 function 读取Cookie(request, name) {
@@ -1252,14 +946,7 @@ async function 确保访问数据库(env) {
 				env.DB.prepare(`CREATE TABLE IF NOT EXISTS notification_state (
 					event_key TEXT PRIMARY KEY, last_payload_hash TEXT NOT NULL, last_sent_at INTEGER NOT NULL, cooldown_until INTEGER NOT NULL)`),
 				env.DB.prepare(`CREATE TABLE IF NOT EXISTS schema_metadata (
-					key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)`),
-				env.DB.prepare(`CREATE TABLE IF NOT EXISTS chatgpt_relay_nonces (
-					nonce_hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`),
-				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_chatgpt_relay_nonces_expiry ON chatgpt_relay_nonces(expires_at)'),
-				env.DB.prepare(`CREATE TABLE IF NOT EXISTS chatgpt_relay_rate_limits (
-					client_hash TEXT PRIMARY KEY, window_started_at INTEGER NOT NULL,
-					request_count INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL)`),
-				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_chatgpt_relay_rate_expiry ON chatgpt_relay_rate_limits(expires_at)')
+					key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)`)
 			]);
 
 			// 迁移文件是正式升级路径；以下检查仅为旧版“首次访问自动建表”部署保留兼容性。
@@ -8467,9 +8154,5 @@ export const __test = Object.freeze({
 	socks5Connect,
 	获取SOCKS5账号,
 	请求优选API,
-	访问链接增强管理页面,
-	计算ChatGPT中继签名,
-	校验ChatGPTCheckout请求体,
-	提取ChatGPTCheckout结果,
-	处理ChatGPTCheckout中继
+	访问链接增强管理页面
 });

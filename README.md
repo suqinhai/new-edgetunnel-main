@@ -142,82 +142,6 @@
 | **TELEGRAM_BOT_TOKEN** / **TELEGRAM_CHAT_ID** | ❌ | — | 可选 Telegram 通知配置，建议使用 Secret 保存 Token |
 | **ABNORMAL_CONNECTIONS_PER_HOUR** | ❌ | `500` | 单链接每小时异常连接量通知阈值 |
 | **AUDIT_RETENTION_DAYS** | ❌ | `90` | 定时清理审计日志的保留天数（7～365） |
-| **RADAR_RELAY_SECRET** | 中继必填 | `长随机密钥` | ChatGPT checkout 中继 HMAC 密钥；必须使用 Worker Secret，不得提交到仓库 |
-| **RADAR_RELAY_MAX_BODY_BYTES** | ❌ | `65536` | 中继请求体上限，最大不会超过 64 KB |
-| **RADAR_RELAY_TIMEOUT_MS** | ❌ | `25000` | 代理连接、TLS 和上游响应的总超时 |
-| **RADAR_RELAY_RATE_LIMIT** | ❌ | `30` | 每个来源 IP 每分钟最多请求数（1～300） |
-| **RADAR_RELAY_ALLOWED_PAYMENT_HOSTS** | ❌ | `checkout.stripe.com,buy.stripe.com` | 允许返回的 HTTPS 支付域名精确白名单 |
-
----
-
-## 🔐 ChatGPT checkout 国家中继
-
-`POST /internal/chatgpt/checkout` 是一个只供服务端调用的受保护接口。它仅能请求固定目标 `https://chatgpt.com/backend-api/payments/checkout`，不接受 URL、hostname、port 或 target。请求会按 `country` 从 D1 `proxy_ip_pool` 中选择未隔离、健康分高、延迟低的同国家 PROXYIP；没有候选时会强制同步一次该国家数据源后重查。
-
-该接口必须绑定名为 `DB` 的 D1 数据库，并先应用 `0006_chatgpt_relay.sql`。生产密钥使用：
-
-```bash
-npx wrangler secret put RADAR_RELAY_SECRET
-npx wrangler d1 migrations apply edgetunnel-access --remote
-```
-
-本地开发可复制 `.dev.vars.example` 为 `.dev.vars` 并替换为长随机密钥；`.dev.vars` 已被 Git 忽略时仍应避免共享。D1 只保存 nonce 的 SHA-256 hash、过期时间与限流计数，不保存 Access Token 或 nonce 原文。
-
-### 与 chatgpt-business-price-radar 对接
-
-价格雷达的服务端配置：
-
-```env
-CHATGPT_RELAY_URL=https://当前-edgetunnel域名/internal/chatgpt/checkout
-CHATGPT_RELAY_SECRET=与-RADAR_RELAY_SECRET-相同的密钥
-```
-
-TypeScript 签名与请求示例（必须放在服务端，不要在浏览器暴露密钥或 Access Token）：
-
-```ts
-import { createHmac, randomBytes } from "node:crypto";
-
-const body = {
-  country: "SG",
-  accessToken: userProvidedAccessToken,
-  payload: {
-    plan_name: "chatgptteamplan",
-    team_plan_data: {
-      workspace_name: "My workspace",
-      price_interval: "month",
-      seat_quantity: 2,
-    },
-    billing_details: { country: "SG", currency: "SGD" },
-    cancel_url: "https://chatgpt.com/?promoCode=EXAMPLE",
-    promo_code: "EXAMPLE",
-    checkout_ui_mode: "hosted",
-  },
-};
-
-const timestamp = Date.now().toString();
-const nonce = randomBytes(24).toString("base64url");
-const rawRequestBody = JSON.stringify(body);
-const signature = createHmac("sha256", process.env.CHATGPT_RELAY_SECRET!)
-  .update(`${timestamp}.${nonce}.${rawRequestBody}`)
-  .digest("hex");
-
-const response = await fetch(process.env.CHATGPT_RELAY_URL!, {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    "X-Relay-Timestamp": timestamp,
-    "X-Relay-Nonce": nonce,
-    "X-Relay-Signature": signature,
-  },
-  body: rawRequestBody,
-});
-const result = await response.json();
-if (!response.ok || !result.ok) throw new Error(result.error ?? "relay_failed");
-```
-
-成功响应只包含通过白名单校验的 HTTPS 支付 URL、可选 session id、国家代码和 `country-relay` 网络标识。不会返回 ChatGPT 原始响应、Access Token、PROXYIP 或内部堆栈。当 ChatGPT 返回 401/403、优惠码或账户业务错误时，不会将代理记为失败；checkout POST 不会自动重试。
-
-安全边界：禁止将此功能改造为任意 URL 代理、端口扫描或任意 TCP 转发；禁止 CAPTCHA/风控绕过、自动注册、共享第三方 Access Token，以及将 Token 写入 D1、KV、URL、日志或错误响应。只能用于用户有权操作的 ChatGPT 账号和自己控制、获得授权的国家出口节点。
 
 ---
 
@@ -254,12 +178,11 @@ npx wrangler d1 migrations apply edgetunnel-access --remote
 npx wrangler deploy
 ```
 
-已有数据库升级时也必须执行上面的 migrations 命令。当前访问管理备份 schema 版本为 **5**（中继短期状态不进入备份），数据库迁移已更新到 `0006`：
+已有数据库升级时也必须执行上面的 migrations 命令。当前 schema 版本为 **5**，新增迁移如下：
 
 - `0003_access_link_limits.sql`：连接统计、限制、IP 绑定、标签、连接租约和连接事件。
 - `0004_proxy_health.sql`：健康评分、连续失败、冷却、真实流量结果和国家阈值。
 - `0005_admin_security_audit.sql`：随机管理员会话、登录限速、审计日志、通知去重和 schema 元数据。
-- `0006_chatgpt_relay.sql`：ChatGPT checkout 中继 nonce hash 防重放与按来源限流状态。
 
 使用 Pages 部署时，也可以在 Cloudflare 控制台为项目添加绑定名为 `DB` 的 D1 数据库。请在 D1 控制台执行迁移，或从本地使用 Wrangler 对同一数据库执行迁移，然后重新部署。运行时仍会兼容旧版“首次访问自动补表”，但正式部署应以 migration 记录为准。
 
