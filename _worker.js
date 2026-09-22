@@ -1177,6 +1177,15 @@ async function 处理管理员单会话退出(request, env, url) {
 
 async function 确保访问数据库(env) {
 	if (!env.DB || typeof env.DB.prepare !== 'function') throw new Error('请先绑定名为 DB 的 D1 数据库');
+	// 已完成正式迁移的数据库只读确认架构，避免每个 Worker 隔离首次请求
+	// 都重复执行 DDL/元数据写入；这也能避免 D1 免费额度耗尽时连普通读请求都抛 1101。
+	try {
+		const schema = await env.DB.prepare("SELECT value FROM schema_metadata WHERE key = 'access_management_schema' LIMIT 1").first();
+		if (String(schema?.value || '') === '5') {
+			await 确保访问IPv4能力列(env);
+			return;
+		}
+	} catch (_) { }
 	if (!访问数据库初始化任务) {
 		访问数据库初始化任务 = (async () => {
 			await env.DB.batch([
@@ -1356,7 +1365,6 @@ async function 确保访问IPv4能力列(env) {
 				['supports_ipv6', 'INTEGER'],
 				['exit_ip', 'TEXT']
 			]) if (!existing.has(name)) await env.DB.prepare(`ALTER TABLE proxy_ip_pool ADD COLUMN ${name} ${definition}`).run();
-			await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_ipv4 ON proxy_ip_pool(country, enabled, supports_ipv4, health_status)').run();
 		})().catch(error => {
 			访问数据库IPv4初始化任务缓存.delete(env.DB);
 			throw error;
