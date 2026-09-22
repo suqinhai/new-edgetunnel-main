@@ -211,6 +211,30 @@ for (const afterData of [false, true]) {
   });
 }
 
+test('强制 IPv4 模式跳过 IPv6 PROXYIP 入口', async () => {
+  const sockets = [];
+  const bridge = { readyState: WebSocket.OPEN, send() {}, close() { this.readyState = WebSocket.CLOSED; } };
+  const request = { fetcher: { connect(options) {
+    let controller;
+    const socket = { ...options, opened: Promise.resolve(), closed: new Promise(() => {}),
+      readable: new ReadableStream({ start(c) { controller = c; } }), writable: new WritableStream(),
+      close() { try { controller.close(); } catch {} }
+    };
+    sockets.push(socket);
+    return socket;
+  } } };
+  const wrapper = {};
+  try {
+    await __test.forwardataTCP('203.0.113.10', 443, Uint8Array.from([1]), bridge, null, wrapper, uuid, request,
+      { 反代IP: '[2001:db8::1],203.0.113.11', 启用反代兜底: false, 强制IPv4: true, 启用SOCKS5反代: null });
+    assert.deepEqual(sockets.map(socket => socket.hostname), ['203.0.113.11']);
+  } finally {
+    bridge.close();
+    for (const socket of sockets) socket.close();
+    await tick();
+  }
+});
+
 test('两个并发续期请求都累加到实际到期时间', async t => {
   const { db, DB } = createDatabase(t);
   const expiry = Date.now() + 3600000;

@@ -5,6 +5,7 @@ let 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓�
 let 访问数据库初始化任务 = null;
 const 本实例活动访问连接 = new Map();
 const 反代解析缓存 = new Map();
+const IPv4目标解析缓存 = new Map();
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
@@ -12,6 +13,11 @@ const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Mat
 const 上行合包目标字节 = 16 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain静默毫秒 = 0;
 const TCP并发拨号数 = 2;
+
+function 是否启用强制IPv4(env = null) {
+	const value = String(env?.FORCE_IPV4 ?? '').trim().toLowerCase();
+	return ['1', 'true', 'yes', 'on'].includes(value);
+}
 const ChatGPTCheckout目标主机 = 'chatgpt.com';
 const ChatGPTCheckout目标路径 = '/backend-api/payments/checkout';
 const ChatGPT中继最大正文字节 = 64 * 1024;
@@ -75,7 +81,7 @@ export default {
 		// 旧的订阅生成流程仍读取这两个默认值；实际隧道连接使用下面的请求级快照。
 		反代IP = 请求反代IP;
 		启用反代兜底 = 请求启用反代兜底;
-		let 请求反代上下文 = { 反代IP: 请求反代IP, 启用反代兜底: 请求启用反代兜底, 启用SOCKS5反代: null, 启用SOCKS5全局反代: false, parsedSocks5Address: {} };
+		let 请求反代上下文 = { 反代IP: 请求反代IP, 启用反代兜底: 请求启用反代兜底, 强制IPv4: 是否启用强制IPv4(env), 启用SOCKS5反代: null, 启用SOCKS5全局反代: false, parsedSocks5Address: {} };
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
 		if (缓存SOCKS5白名单 === null) {
 			if (env.GO2SOCKS5) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(await 整理成数组(env.GO2SOCKS5)))];
@@ -817,10 +823,14 @@ function ChatGPT中继HTTP响应已完整(bytes) {
 	return false;
 }
 
-async function 通过PROXYIP发送ChatGPTCheckout(request, proxyIP, accessToken, payload, timeoutMs) {
+async function 通过PROXYIP发送ChatGPTCheckout(request, proxyIP, accessToken, payload, timeoutMs, 强制IPv4 = false) {
 	let socket = null, tlsSocket = null;
 	const operation = (async () => {
-		const endpoints = await 解析地址端口(proxyIP, ChatGPTCheckout目标主机, '00000000-0000-4000-8000-000000000000');
+		const resolvedEndpoints = await 解析地址端口(proxyIP, ChatGPTCheckout目标主机, '00000000-0000-4000-8000-000000000000');
+		const endpoints = 强制IPv4
+			? await 展开IPv4连接候选(resolvedEndpoints)
+			: resolvedEndpoints;
+		if (强制IPv4 && !endpoints.length) throw new Error('strict_ipv4_proxy_endpoint_unavailable');
 		const endpoint = endpoints[0];
 		if (!endpoint) throw new Error('proxy_endpoint_unavailable');
 		const TCP连接 = 创建请求TCP连接器(request);
@@ -904,12 +914,14 @@ async function 处理ChatGPTCheckout中继(request, env, ctx = null, transport =
 	try { validated = 校验ChatGPTCheckout请求体(JSON.parse(rawBody)) }
 	catch (_) { return ChatGPT中继响应('invalid_payload', '请求参数无效', 400); }
 	const session = 获取访问数据库会话(env);
+	const 仅IPv4 = 是否启用强制IPv4(env);
 	let candidates;
 	try {
-		candidates = (await 查询健康访问代理候选(session, validated.country, '')).results || [];
+		candidates = (await 查询健康访问代理候选(session, validated.country, '', Date.now(), 仅IPv4)).results || [];
 		if (!candidates.length) {
 			await 同步到期访问PROXYIP数据源(env, { country: validated.country, force: true });
-			candidates = (await 查询健康访问代理候选(session, validated.country, '')).results || [];
+			if (仅IPv4) await 检测访问PROXYIP池(env, validated.country, 24);
+			candidates = (await 查询健康访问代理候选(session, validated.country, '', Date.now(), 仅IPv4)).results || [];
 		}
 	} catch (_) { candidates = []; }
 	const selected = candidates[0];
@@ -918,7 +930,7 @@ async function 处理ChatGPTCheckout中继(request, env, ctx = null, transport =
 	let upstream;
 	const startedAt = Date.now();
 	try {
-		upstream = await transport(request, selected.proxy_ip, validated.accessToken, validated.payload, timeoutMs);
+		upstream = await transport(request, selected.proxy_ip, validated.accessToken, validated.payload, timeoutMs, 仅IPv4);
 		await 记录访问PROXYIP结果(env, { country: validated.country, proxyIP: selected.proxy_ip, success: true, real: true, latency: Date.now() - startedAt });
 	} catch (_) {
 		try { await 记录访问PROXYIP结果(env, { country: validated.country, proxyIP: selected.proxy_ip, success: false, real: true, error: 'relay_network_failure' }) } catch (_) { }
@@ -1199,6 +1211,10 @@ async function 确保访问数据库(env) {
 				proxy_ip TEXT NOT NULL,
 				enabled INTEGER NOT NULL DEFAULT 1,
 				created_at INTEGER NOT NULL,
+				ip_stack TEXT NOT NULL DEFAULT 'unknown',
+				supports_ipv4 INTEGER,
+				supports_ipv6 INTEGER,
+				exit_ip TEXT,
 				UNIQUE(country, proxy_ip)
 				)`),
 				env.DB.prepare(`CREATE TABLE IF NOT EXISTS proxy_ip_sources (
@@ -1294,7 +1310,11 @@ async function 确保访问数据库(env) {
 				['cooldown_until', 'INTEGER'],
 				['real_success_count', 'INTEGER NOT NULL DEFAULT 0'],
 				['real_failure_count', 'INTEGER NOT NULL DEFAULT 0'],
-				['last_real_failure', 'INTEGER']
+				['last_real_failure', 'INTEGER'],
+				['ip_stack', "TEXT NOT NULL DEFAULT 'unknown'"],
+				['supports_ipv4', 'INTEGER'],
+				['supports_ipv6', 'INTEGER'],
+				['exit_ip', 'TEXT']
 			]);
 			await 补充缺失列('proxy_ip_sources', [
 				['consecutive_failures', 'INTEGER NOT NULL DEFAULT 0'],
@@ -1305,6 +1325,7 @@ async function 确保访问数据库(env) {
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_source ON proxy_ip_pool(source_id)'),
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_health ON proxy_ip_pool(country, enabled, health_status, failure_count)'),
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_score ON proxy_ip_pool(country, enabled, cooldown_until, health_score)'),
+				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_ipv4 ON proxy_ip_pool(country, enabled, supports_ipv4, health_status)'),
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_links_tags ON access_links(tags)'),
 				env.DB.prepare(`INSERT INTO schema_metadata(key, value, updated_at) VALUES ('access_management_schema', '5', ?1)
 					ON CONFLICT(key) DO UPDATE SET value = '5', updated_at = ?1`).bind(Date.now())
@@ -1357,9 +1378,11 @@ function 访问限制错误(记录, clientIP, now = Date.now()) {
 	return null;
 }
 
-async function 查询健康访问代理候选(session, country, currentProxy, now = Date.now()) {
+
+async function 查询健康访问代理候选(session, country, currentProxy, now = Date.now(), 仅IPv4 = false) {
 	return await session.prepare(`SELECT * FROM proxy_ip_pool
 		WHERE country = ?1 AND enabled = 1
+			${仅IPv4 ? 'AND supports_ipv4 = 1' : ''}
 			AND (cooldown_until IS NULL OR cooldown_until <= ?3)
 			AND (health_status <> 'unhealthy' OR cooldown_until <= ?3)
 		ORDER BY CASE WHEN proxy_ip = ?2 THEN 0 ELSE 1 END,
@@ -1391,10 +1414,12 @@ async function 激活访问授权上下文(上下文) {
 		if (记录.uuid !== 请求认证UUID) throw Object.assign(new Error('访问凭据已轮换，请更新节点后重试'), { status: 403 });
 		const linkId = 记录.id, connectionEpoch = Number(记录.connection_epoch || 0);
 
-		let IP结果 = await 查询健康访问代理候选(session, 记录.country, 记录.proxy_ip);
+		const 仅IPv4 = 是否启用强制IPv4(上下文.env);
+		let IP结果 = await 查询健康访问代理候选(session, 记录.country, 记录.proxy_ip, Date.now(), 仅IPv4);
 		if (!(IP结果.results || []).length) {
 			await 同步到期访问PROXYIP数据源(上下文.env, { country: 记录.country });
-			IP结果 = await 查询健康访问代理候选(session, 记录.country, 记录.proxy_ip);
+			if (仅IPv4) await 检测访问PROXYIP池(上下文.env, 记录.country, 24);
+			IP结果 = await 查询健康访问代理候选(session, 记录.country, 记录.proxy_ip, Date.now(), 仅IPv4);
 		}
 		const 候选反代IP = (IP结果.results || []).map(item => item.proxy_ip);
 		const 选定反代IP = 候选反代IP[0] || null;
@@ -1459,6 +1484,7 @@ async function 激活访问授权上下文(上下文) {
 		上下文.反代上下文 = {
 			反代IP: [记录.proxy_ip, ...候选反代IP.filter(item => item !== 记录.proxy_ip)].join(','),
 			启用反代兜底: false,
+			强制IPv4: 仅IPv4,
 			启用SOCKS5反代: null,
 			启用SOCKS5全局反代: false,
 			parsedSocks5Address: {},
@@ -1882,6 +1908,10 @@ async function 同步单个访问PROXYIP数据源(env, source, targetCountry = '
 					consecutive_failures = CASE WHEN ?5 = 1 THEN 0 ELSE consecutive_failures END,
 					cooldown_until = CASE WHEN ?5 = 1 THEN NULL ELSE cooldown_until END,
 					last_error = CASE WHEN ?5 = 1 THEN '' ELSE last_error END,
+					ip_stack = CASE WHEN ?5 = 1 THEN 'unknown' ELSE ip_stack END,
+					supports_ipv4 = CASE WHEN ?5 = 1 THEN NULL ELSE supports_ipv4 END,
+					supports_ipv6 = CASE WHEN ?5 = 1 THEN NULL ELSE supports_ipv6 END,
+					exit_ip = CASE WHEN ?5 = 1 THEN NULL ELSE exit_ip END,
 					updated_at = ?3`)
 				.bind(entry.country, entry.proxy_ip, now, source.id, 重置健康状态 ? 1 : 0)));
 		}
@@ -1933,13 +1963,37 @@ async function 同步到期访问PROXYIP数据源(env, { force = false, country 
 	return summaries;
 }
 
+function 解析PROXYIP检测能力(data) {
+	const ipv4Probe = data?.probe_results?.ipv4;
+	const ipv6Probe = data?.probe_results?.ipv6;
+	const 读取能力 = value => value === true || value === 1 || value === '1' || String(value).toLowerCase() === 'true'
+		? true
+		: value === false || value === 0 || value === '0' || String(value).toLowerCase() === 'false'
+			? false
+			: null;
+	let supportsIPv4 = 读取能力(data?.supports_ipv4);
+	let supportsIPv6 = 读取能力(data?.supports_ipv6);
+	if (supportsIPv4 === null) supportsIPv4 = 读取能力(ipv4Probe?.ok);
+	if (supportsIPv6 === null) supportsIPv6 = 读取能力(ipv6Probe?.ok);
+	let stack = String(data?.inferred_stack || '').toLowerCase();
+	if (!['ipv4_only', 'ipv6_only', 'dual_stack'].includes(stack)) {
+		stack = supportsIPv4 === true && supportsIPv6 === true ? 'dual_stack' : supportsIPv4 === true ? 'ipv4_only' : supportsIPv6 === true ? 'ipv6_only' : 'unknown';
+	}
+	if (supportsIPv4 === null && stack !== 'ipv6_only') supportsIPv4 = stack === 'ipv4_only' || stack === 'dual_stack' ? true : null;
+	if (supportsIPv6 === null && stack !== 'ipv4_only') supportsIPv6 = stack === 'ipv6_only' || stack === 'dual_stack' ? true : null;
+	const exitIP = String((supportsIPv4 === true ? ipv4Probe?.exit?.ip : null) || ipv6Probe?.exit?.ip || data?.exit?.ip || '').slice(0, 80);
+	return { supportsIPv4, supportsIPv6, stack, exitIP };
+}
+
 async function 检测访问PROXYIP池(env, country, limit = 8) {
+	const 仅IPv4 = 是否启用强制IPv4(env);
 	const checkedAt = Date.now();
 	const result = await env.DB.prepare(`SELECT * FROM proxy_ip_pool
 		WHERE country = ?1 AND enabled = 1
 			AND (cooldown_until IS NULL OR cooldown_until <= ?3)
-			AND (health_status <> 'healthy' OR last_checked_at IS NULL OR last_checked_at < ?2)
-		ORDER BY CASE health_status WHEN 'unknown' THEN 0 WHEN 'unhealthy' THEN 1 ELSE 2 END, health_score ASC, RANDOM()
+			AND (supports_ipv4 IS NULL OR health_status <> 'healthy' OR last_checked_at IS NULL OR last_checked_at < ?2)
+		ORDER BY CASE WHEN supports_ipv4 IS NULL THEN 0 ELSE 1 END,
+			CASE health_status WHEN 'unknown' THEN 0 WHEN 'unhealthy' THEN 1 ELSE 2 END, health_score ASC, RANDOM()
 		LIMIT ?4`).bind(country, checkedAt - 6 * 3600000, checkedAt, Math.min(24, Math.max(1, Number(limit) || 8))).all();
 	const candidates = result.results || [];
 	let success = 0, failed = 0, unavailable = 0, cursor = 0;
@@ -1953,12 +2007,28 @@ async function 检测访问PROXYIP池(env, country, limit = 8) {
 				const response = await fetch(访问PROXYIP检测URL + encodeURIComponent(endpoint), { signal: controller.signal, headers: { Accept: 'application/json' } });
 				if (!response.ok) throw new Error(`检测服务 HTTP ${response.status}`);
 				const data = await response.json();
-				if (data.success) {
+				const capability = 解析PROXYIP检测能力(data);
+				if (data.success && (!仅IPv4 || capability.supportsIPv4 === true)) {
 					success++;
 					await env.DB.prepare(`UPDATE proxy_ip_pool SET health_status = 'healthy', latency_ms = ?1,
 						failure_count = 0, consecutive_failures = 0, cooldown_until = NULL,
-						health_score = MIN(100, health_score + 8), last_checked_at = ?2, last_success_at = ?2, last_error = '' WHERE id = ?3`)
-						.bind(Math.max(0, Math.round(Number(data.responseTime) || 0)), checkedAt, candidate.id).run();
+						health_score = MIN(100, health_score + 8), last_checked_at = ?2, last_success_at = ?2, last_error = '',
+						ip_stack = ?3, supports_ipv4 = ?4, supports_ipv6 = ?5, exit_ip = ?6 WHERE id = ?7`)
+						.bind(Math.max(0, Math.round(Number(data.responseTime) || 0)), checkedAt, capability.stack,
+							capability.supportsIPv4 === true ? 1 : capability.supportsIPv4 === false ? 0 : null,
+							capability.supportsIPv6 === true ? 1 : capability.supportsIPv6 === false ? 0 : null,
+							capability.exitIP || null, candidate.id).run();
+				} else if (data.success) {
+					failed++;
+					const reason = capability.supportsIPv4 === false && capability.supportsIPv6 === true ? '仅支持 IPv6 出口' : '检测服务未确认 IPv4 出口';
+					await env.DB.prepare(`UPDATE proxy_ip_pool SET health_status = 'unhealthy', health_score = 0,
+						consecutive_failures = consecutive_failures + 1, failure_count = failure_count + 1,
+						cooldown_until = NULL, last_checked_at = ?1, last_error = ?2,
+						ip_stack = ?3, supports_ipv4 = ?4, supports_ipv6 = ?5, exit_ip = ?6 WHERE id = ?7`)
+						.bind(checkedAt, reason, capability.stack,
+							capability.supportsIPv4 === false ? 0 : null,
+							capability.supportsIPv6 === true ? 1 : capability.supportsIPv6 === false ? 0 : null,
+							capability.exitIP || null, candidate.id).run();
 				} else {
 					failed++;
 					await 记录访问PROXYIP结果(env, { country, proxyIP: candidate.proxy_ip, success: false, real: false, error: 'PROXYIP 检测失败', checkedAt });
@@ -1984,8 +2054,14 @@ async function 记录访问PROXYIP结果(env, { country, proxyIP, success, real 
 		.bind(country, endpoint, hostOnly).first();
 	if (!record) return;
 	if (success) {
-		await env.DB.prepare(`UPDATE proxy_ip_pool SET health_status = 'healthy', health_score = MIN(100, health_score + ?1),
-			consecutive_failures = 0, failure_count = 0, cooldown_until = NULL, last_success_at = ?2,
+		const 仅IPv4 = 是否启用强制IPv4(env);
+		const 可恢复健康条件 = 仅IPv4 ? 'supports_ipv4 = 1' : '1 = 1';
+		await env.DB.prepare(`UPDATE proxy_ip_pool SET
+			health_status = CASE WHEN ${可恢复健康条件} THEN 'healthy' ELSE health_status END,
+			health_score = CASE WHEN ${可恢复健康条件} THEN MIN(100, health_score + ?1) ELSE health_score END,
+			consecutive_failures = CASE WHEN ${可恢复健康条件} THEN 0 ELSE consecutive_failures END,
+			failure_count = CASE WHEN ${可恢复健康条件} THEN 0 ELSE failure_count END,
+			cooldown_until = CASE WHEN ${可恢复健康条件} THEN NULL ELSE cooldown_until END, last_success_at = ?2,
 			last_checked_at = CASE WHEN ?3 = 1 THEN last_checked_at ELSE ?2 END,
 			latency_ms = CASE WHEN ?4 IS NULL THEN latency_ms WHEN latency_ms IS NULL THEN ?4 ELSE CAST((latency_ms * 3 + ?4) / 4 AS INTEGER) END,
 			real_success_count = real_success_count + ?3, last_error = '' WHERE id = ?5`)
@@ -2065,7 +2141,8 @@ async function 发送管理通知(env, eventKey, title, payload, cooldownSeconds
 
 async function 检查访问管理通知(env) {
 	const now = Date.now(), defaultMinimum = Math.min(100, Math.max(1, Number(env.MIN_HEALTHY_IPS_PER_COUNTRY) || 3));
-	const low = await env.DB.prepare(`SELECT l.country, COUNT(DISTINCT CASE WHEN p.enabled = 1 AND p.health_status = 'healthy'
+	const 仅IPv4 = 是否启用强制IPv4(env);
+	const low = await env.DB.prepare(`SELECT l.country, COUNT(DISTINCT CASE WHEN p.enabled = 1${仅IPv4 ? ' AND p.supports_ipv4 = 1' : ''} AND p.health_status = 'healthy'
 		AND (p.cooldown_until IS NULL OR p.cooldown_until <= ?1) THEN p.id END) AS healthy,
 		COALESCE(c.min_healthy_ips, ?2) AS minimum
 		FROM access_links l LEFT JOIN proxy_ip_pool p ON p.country = l.country
@@ -2128,6 +2205,7 @@ async function 执行访问链接操作({ session, env, request, adminSession, i
 	const before = await session.prepare('SELECT * FROM access_links WHERE id = ?1').bind(id).first();
 	if (!before) throw new Error('访问链接不存在');
 	const now = Date.now();
+	const 仅IPv4 = 是否启用强制IPv4(env);
 	let result;
 	if (action === 'revoke' || action === 'disable') {
 		result = await session.prepare("UPDATE access_links SET status = 'revoked' WHERE id = ?1 AND status = 'active'").bind(id).run();
@@ -2156,7 +2234,7 @@ async function 执行访问链接操作({ session, env, request, adminSession, i
 	} else if (action === 'reassign') {
 		const candidate = await session.prepare(`SELECT proxy_ip FROM proxy_ip_pool WHERE country = ?1 AND enabled = 1
 			AND proxy_ip <> COALESCE(?2, '') AND (cooldown_until IS NULL OR cooldown_until <= ?3)
-			AND health_status <> 'unhealthy' ORDER BY CASE health_status WHEN 'healthy' THEN 0 ELSE 1 END,
+			${仅IPv4 ? 'AND supports_ipv4 = 1' : ''} AND health_status <> 'unhealthy' ORDER BY CASE health_status WHEN 'healthy' THEN 0 ELSE 1 END,
 			health_score DESC, latency_ms ASC, RANDOM() LIMIT 1`).bind(before.country, before.proxy_ip, now).first();
 		if (!candidate) throw new Error(`${before.country} 没有其他健康备用 PROXYIP`);
 		result = await session.prepare('UPDATE access_links SET proxy_ip = ?1 WHERE id = ?2').bind(candidate.proxy_ip, id).run();
@@ -2270,6 +2348,9 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 		if (pathname === '/admin/access' && request.method === 'GET') return 访问链接增强管理页面();
 
 		const session = 获取访问数据库会话(env);
+		const 强制IPv4模式 = 是否启用强制IPv4(env);
+		const 池IPv4条件 = 强制IPv4模式 ? ' AND supports_ipv4 = 1' : '';
+		const 池未知条件 = 强制IPv4模式 ? ' AND supports_ipv4 IS NULL' : " AND health_status = 'unknown'";
 		if (pathname === '/admin/access/api/audit' && request.method === 'GET') {
 			const limit = Math.min(100, Math.max(1, Math.floor(Number(url.searchParams.get('limit')) || 25)));
 			const offset = Math.max(0, Math.floor(Number(url.searchParams.get('offset')) || 0));
@@ -2376,10 +2457,10 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 					SUM(active_connections) AS current_connections
 					FROM access_links`).bind(now).first(),
 				session.prepare('SELECT * FROM proxy_ip_sources ORDER BY id').all(),
-				session.prepare(`SELECT p.country, COUNT(DISTINCT p.id) AS total,
-					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status <> 'unhealthy' THEN p.id END) AS available,
-					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status = 'healthy' THEN p.id END) AS healthy,
-					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status = 'unknown' THEN p.id END) AS unknown,
+					session.prepare(`SELECT p.country, COUNT(DISTINCT p.id) AS total,
+					COUNT(DISTINCT CASE WHEN enabled = 1${池IPv4条件} AND health_status <> 'unhealthy' THEN p.id END) AS available,
+					COUNT(DISTINCT CASE WHEN enabled = 1${池IPv4条件} AND health_status = 'healthy' THEN p.id END) AS healthy,
+					COUNT(DISTINCT CASE WHEN enabled = 1${池未知条件} THEN p.id END) AS unknown,
 					COUNT(DISTINCT CASE WHEN enabled = 1 AND (health_status = 'unhealthy' OR cooldown_until > ?1) THEN p.id END) AS isolated,
 					ROUND(AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END)) AS average_latency_ms,
 					MAX(last_checked_at) AS last_checked_at, ROUND(AVG(health_score)) AS average_health_score,
@@ -2443,7 +2524,7 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			if (overwrite && body.confirmOverwrite !== 'RESTORE OVERWRITE') throw new Error('覆盖恢复需要二次确认文本 RESTORE OVERWRITE');
 			const tableColumns = {
 				proxy_ip_sources: ['id','name','url','default_country','enabled','refresh_minutes','max_per_country','last_synced_at','last_status','last_error','created_at','updated_at','consecutive_failures'],
-				proxy_ip_pool: ['id','country','proxy_ip','enabled','created_at','source_id','health_status','latency_ms','failure_count','last_checked_at','last_success_at','last_error','updated_at','health_score','consecutive_failures','cooldown_until','real_success_count','real_failure_count','last_real_failure'],
+				proxy_ip_pool: ['id','country','proxy_ip','enabled','created_at','source_id','health_status','latency_ms','failure_count','last_checked_at','last_success_at','last_error','updated_at','health_score','consecutive_failures','cooldown_until','real_success_count','real_failure_count','last_real_failure','ip_stack','supports_ipv4','supports_ipv6','exit_ip'],
 				access_links: ['id','token','uuid','country','duration_seconds','proxy_ip','status','note','created_at','first_used_at','expires_at','last_used_at','connection_count','active_connections','last_client_ip','last_client_asn','max_concurrent_connections','max_total_connections','bind_first_ip','bound_ip','tags','connection_epoch'],
 				proxy_ip_source_sync: ['source_id','country','last_synced_at','last_status','last_error'],
 				country_health_config: ['country','min_healthy_ips','updated_at']
@@ -2512,14 +2593,14 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			if (!Number.isInteger(maxTotal) || maxTotal < 0 || maxTotal > 10000000) throw new Error('累计上限必须是 0 到 10000000');
 			await 同步到期访问PROXYIP数据源(env, { country });
 			let poolState = await session.prepare(`SELECT
-				SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
-				SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
+				SUM(CASE WHEN enabled = 1${池IPv4条件} AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
+				SUM(CASE WHEN enabled = 1${池未知条件} THEN 1 ELSE 0 END) AS unknown
 				FROM proxy_ip_pool WHERE country = ?1`).bind(country).first();
 			if (!Number(poolState?.healthy) && Number(poolState?.unknown)) {
 				await 检测访问PROXYIP池(env, country, 8);
 				poolState = await session.prepare(`SELECT
-					SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
-					SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
+					SUM(CASE WHEN enabled = 1${池IPv4条件} AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
+					SUM(CASE WHEN enabled = 1${池未知条件} THEN 1 ELSE 0 END) AS unknown
 					FROM proxy_ip_pool WHERE country = ?1`).bind(country).first();
 			}
 			if (!Number(poolState?.healthy) && !Number(poolState?.unknown)) {
@@ -2527,8 +2608,8 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 				await 同步到期访问PROXYIP数据源(env, { force: true, country });
 				await 检测访问PROXYIP池(env, country, 8);
 				poolState = await session.prepare(`SELECT
-					SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
-					SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
+					SUM(CASE WHEN enabled = 1${池IPv4条件} AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
+					SUM(CASE WHEN enabled = 1${池未知条件} THEN 1 ELSE 0 END) AS unknown
 					FROM proxy_ip_pool WHERE country = ?1`).bind(country).first();
 			}
 			if (!Number(poolState?.healthy) && !Number(poolState?.unknown)) throw new Error(`${country} 暂无可用 PROXYIP，请同步数据源或稍后重试`);
@@ -4196,7 +4277,7 @@ async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 
 function 获取TCP反代配置(请求反代上下文 = null) {
 	if (请求反代上下文) return 请求反代上下文;
-	return { 反代IP, 启用反代兜底, 启用SOCKS5反代, 启用SOCKS5全局反代, parsedSocks5Address };
+	return { 反代IP, 启用反代兜底, 强制IPv4: false, 启用SOCKS5反代, 启用SOCKS5全局反代, parsedSocks5Address };
 }
 
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null, 请求反代上下文 = null) {
@@ -4207,7 +4288,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const 当前启用SOCKS5全局反代 = 当前反代配置.启用SOCKS5全局反代;
 	const 当前parsedSocks5Address = 当前反代配置.parsedSocks5Address || {};
 	const 当前访问授权上下文 = 当前反代配置.访问授权上下文 || null;
-	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${当前反代IP} | 反代兜底: ${当前启用反代兜底 ? '是' : '否'} | 反代类型: ${当前启用SOCKS5反代 || 'proxyip'} | 全局: ${当前启用SOCKS5全局反代 ? '是' : '否'}`);
+	const 强制使用IPv4 = 当前反代配置.强制IPv4 === true;
+	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${当前反代IP} | 反代兜底: ${当前启用反代兜底 ? '是' : '否'} | 强制IPv4: ${强制使用IPv4 ? '是' : '否'} | 反代类型: ${当前启用SOCKS5反代 || 'proxyip'} | 全局: ${当前启用SOCKS5全局反代 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
 	let 已通过代理发送首包 = false;
 	const TCP连接 = 创建请求TCP连接器(request, remoteConnWrapper);
@@ -4282,13 +4364,19 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 	async function connectDirect(address, port, data = null, 所有反代数组 = null, 反代兜底 = true) {
 		if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
-		if (所有反代数组 && 所有反代数组.length > 0) {
-			for (let i = 0; i < 所有反代数组.length; i += TCP并发拨号数) {
+		const 可用反代数组 = 强制使用IPv4
+			? await 展开IPv4连接候选(所有反代数组 || [])
+			: (所有反代数组 || []);
+		if (强制使用IPv4 && 所有反代数组?.length && !可用反代数组.length && !反代兜底) {
+			throw new Error('严格 IPv4 模式下没有可用的 IPv4 反代入口');
+		}
+		if (可用反代数组.length > 0) {
+			for (let i = 0; i < 可用反代数组.length; i += TCP并发拨号数) {
 				if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
 				const 候选列表 = [];
-				for (let j = 0; j < TCP并发拨号数 && i + j < 所有反代数组.length; j++) {
-					const 反代数组索引 = (缓存反代数组索引 + i + j) % 所有反代数组.length;
-					const [反代地址, 反代端口] = 所有反代数组[反代数组索引];
+				for (let j = 0; j < TCP并发拨号数 && i + j < 可用反代数组.length; j++) {
+					const 反代数组索引 = (缓存反代数组索引 + i + j) % 可用反代数组.length;
+					const [反代地址, 反代端口] = 可用反代数组[反代数组索引];
 					候选列表.push({ hostname: 反代地址, port: 反代端口, index: 反代数组索引 });
 				}
 				let socket = null, candidate = null;
@@ -4307,10 +4395,19 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				}
 			}
 		}
+		if (强制使用IPv4 && 所有反代数组?.length && !可用反代数组.length && !反代兜底) {
+			throw new Error('严格 IPv4 模式下没有可用连接候选');
+		}
 
 		if (反代兜底) {
-			const 候选列表 = Array.from({ length: TCP并发拨号数 }, (_, attempt) => ({ hostname: address, port, attempt }));
-			log(`[TCP直连] 并发尝试 ${候选列表.length} 路: ${address}:${port}`);
+			let 兜底地址 = address;
+			if (强制使用IPv4) {
+				const 兜底候选 = await 展开IPv4连接候选([[address, port]]);
+				if (!兜底候选.length) throw new Error('严格 IPv4 模式下没有可用的 IPv4 兜底入口');
+				兜底地址 = 兜底候选[0][0];
+			}
+			const 候选列表 = Array.from({ length: TCP并发拨号数 }, (_, attempt) => ({ hostname: 兜底地址, port, attempt }));
+			log(`[TCP直连] 并发尝试 ${候选列表.length} 路: ${兜底地址}:${port}`);
 			let socket = null;
 			try {
 				const 连接结果 = await 并发打开候选连接(候选列表);
@@ -4401,10 +4498,25 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			log(`[TCP转发] SOCKS5/HTTP/HTTPS/TURN/SSTP 代理连接失败: ${err.message}`);
 			throw err;
 		}
+	} else if (强制使用IPv4 && 当前反代IP && !当前启用反代兜底) {
+		// 显式/国家 PROXYIP 必须优先使用，不允许直连抢先导致 IPv6 出口或绕过国家节点。
+		try {
+			await connecttoPry();
+		} catch (err) {
+			log(`[TCP转发] 强制 IPv4 反代连接失败: ${err.message}`);
+			throw err;
+		}
 	} else {
 		try {
 			log(`[TCP转发] 尝试直连到: ${host}:${portNum}`);
-			const initialSocket = await connectDirect(host, portNum, rawData);
+			let initialSocket;
+			if (强制使用IPv4) {
+				const IPv4地址 = await 获取IPv4目标地址(host);
+				if (!IPv4地址.length) throw new Error(`严格 IPv4 模式下 ${host} 没有可用 A 记录`);
+				initialSocket = await connectDirect(host, portNum, rawData, IPv4地址.map(ip => [ip, portNum]), false);
+			} else {
+				initialSocket = await connectDirect(host, portNum, rawData);
+			}
 			if (ws.readyState !== WebSocket.OPEN) { try { initialSocket.close() } catch (_) { } return; }
 			if (当前访问授权上下文) 当前访问授权上下文.代理连接成功 = true;
 			remoteConnWrapper.socket = initialSocket;
@@ -5847,6 +5959,34 @@ async function withTimeout(promise, timeoutMs, message) {
 function isIPv4(value) {
 	const parts = String(value || '').split('.');
 	return parts.length === 4 && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+}
+
+async function 获取IPv4目标地址(hostname) {
+	const host = stripIPv6Brackets(hostname);
+	if (isIPv4(host)) return [host];
+	if (!host || isIPHostname(host)) return [];
+	const cacheKey = host.toLowerCase();
+	if (IPv4目标解析缓存.has(cacheKey)) return IPv4目标解析缓存.get(cacheKey);
+	let addresses = [];
+	try {
+		const records = await DoH查询(host, 'A');
+		addresses = [...new Set((records || []).filter(record => record.type === 1 && isIPv4(record.data)).map(record => record.data))];
+	} catch (_) { }
+	if (IPv4目标解析缓存.size >= 64) IPv4目标解析缓存.delete(IPv4目标解析缓存.keys().next().value);
+	IPv4目标解析缓存.set(cacheKey, addresses);
+	return addresses;
+}
+
+async function 展开IPv4连接候选(候选数组 = []) {
+	const groups = await Promise.all((候选数组 || []).map(async ([address, port]) => {
+		const host = stripIPv6Brackets(address);
+		if (isIPv4(host)) return [[address, port]];
+		const addresses = await 获取IPv4目标地址(host);
+		return addresses.map(ip => [ip, port]);
+	}));
+	const unique = new Map();
+	for (const [address, port] of groups.flat()) unique.set(`${address}:${port}`, [address, port]);
+	return [...unique.values()];
 }
 
 function turnStunPadding(length) {
@@ -7977,6 +8117,7 @@ async function 反代参数获取(url, uuid, 初始反代上下文 = {}) {
 	const pathname = decodeURIComponent(url.pathname);
 	let 本次反代IP = 初始反代上下文.反代IP ?? 反代IP;
 	let 本次启用反代兜底 = 初始反代上下文.启用反代兜底 ?? 启用反代兜底;
+	let 本次强制IPv4 = 初始反代上下文.强制IPv4 ?? false;
 	let 本次启用SOCKS5反代 = null;
 	let 本次启用SOCKS5全局反代 = searchParams.has('globalproxy');
 	let 本次SOCKS5账号 = searchParams.get('socks5') || searchParams.get('http') || searchParams.get('https') || searchParams.get('turn') || searchParams.get('sstp') || null;
@@ -7984,6 +8125,7 @@ async function 反代参数获取(url, uuid, 初始反代上下文 = {}) {
 	const 构建反代上下文 = () => ({
 		反代IP: 本次反代IP,
 		启用反代兜底: 本次启用反代兜底,
+		强制IPv4: 本次强制IPv4,
 		启用SOCKS5反代: 本次启用SOCKS5反代,
 		启用SOCKS5全局反代: 本次启用SOCKS5全局反代,
 		parsedSocks5Address: 本次代理地址
@@ -7999,6 +8141,7 @@ async function 反代参数获取(url, uuid, 初始反代上下文 = {}) {
 			const 链式代理配置 = {
 				反代IP: '链式代理',
 				启用反代兜底: false,
+				强制IPv4: 初始反代上下文.强制IPv4 ?? false,
 				启用SOCKS5全局反代: true,
 				启用SOCKS5反代: String(type).toLowerCase(),
 				parsedSocks5Address: {
