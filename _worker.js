@@ -3,6 +3,7 @@ const 访问管理增强版本 = '2026-09-11 00:00:00';
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓存反代数组索引 = 0, 启用反代兜底 = true, 调试日志打印 = false;
 let 访问数据库初始化任务 = null;
+const 访问数据库IPv4初始化任务缓存 = new WeakMap();
 const 本实例活动访问连接 = new Map();
 const 反代解析缓存 = new Map();
 const IPv4目标解析缓存 = new Map();
@@ -1340,6 +1341,29 @@ async function 确保访问数据库(env) {
 		});
 	}
 	await 访问数据库初始化任务;
+	await 确保访问IPv4能力列(env);
+}
+
+async function 确保访问IPv4能力列(env) {
+	let 初始化任务 = 访问数据库IPv4初始化任务缓存.get(env.DB);
+	if (!初始化任务) {
+		初始化任务 = (async () => {
+			const result = await env.DB.prepare('PRAGMA table_info(proxy_ip_pool)').all();
+			const existing = new Set((result.results || []).map(item => item.name));
+			for (const [name, definition] of [
+				['ip_stack', "TEXT NOT NULL DEFAULT 'unknown'"],
+				['supports_ipv4', 'INTEGER'],
+				['supports_ipv6', 'INTEGER'],
+				['exit_ip', 'TEXT']
+			]) if (!existing.has(name)) await env.DB.prepare(`ALTER TABLE proxy_ip_pool ADD COLUMN ${name} ${definition}`).run();
+			await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_ipv4 ON proxy_ip_pool(country, enabled, supports_ipv4, health_status)').run();
+		})().catch(error => {
+			访问数据库IPv4初始化任务缓存.delete(env.DB);
+			throw error;
+		});
+		访问数据库IPv4初始化任务缓存.set(env.DB, 初始化任务);
+	}
+	await 初始化任务;
 }
 
 function 获取访问数据库会话(env) {
