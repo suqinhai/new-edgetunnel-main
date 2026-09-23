@@ -96,12 +96,14 @@ test('Token/UUID 可分别或同时轮换且保留业务状态', () => {
 test('故障转移跳过当前、隔离及冷却候选并优先评分', () => {
   const now = 1000;
   const selected = __test.选择健康故障转移候选([
-    { proxy_ip: 'current', enabled: 1, health_status: 'healthy', health_score: 99 },
-    { proxy_ip: 'cooldown', enabled: 1, health_status: 'healthy', cooldown_until: 2000, health_score: 98 },
-    { proxy_ip: 'bad', enabled: 1, health_status: 'unhealthy', health_score: 90 },
-    { proxy_ip: 'backup-a', enabled: 1, health_status: 'healthy', health_score: 70, latency_ms: 80 },
-    { proxy_ip: 'backup-b', enabled: 1, health_status: 'healthy', health_score: 80, latency_ms: 120 }
-  ], 'current', now);
+    { proxy_ip: 'current', country: 'TW', exit_country: 'TW', supports_ipv4: 1, enabled: 1, health_status: 'healthy', health_score: 99 },
+    { proxy_ip: 'cooldown', country: 'TW', exit_country: 'TW', supports_ipv4: 1, enabled: 1, health_status: 'healthy', cooldown_until: 2000, health_score: 98 },
+    { proxy_ip: 'bad', country: 'TW', exit_country: 'TW', supports_ipv4: 1, enabled: 1, health_status: 'unhealthy', health_score: 90 },
+    { proxy_ip: 'wrong-country', country: 'TW', exit_country: 'US', supports_ipv4: 1, enabled: 1, health_status: 'healthy', health_score: 100 },
+    { proxy_ip: 'ipv6-only', country: 'TW', exit_country: 'TW', supports_ipv4: 0, enabled: 1, health_status: 'healthy', health_score: 100 },
+    { proxy_ip: 'backup-a', country: 'TW', exit_country: 'TW', supports_ipv4: 1, enabled: 1, health_status: 'healthy', health_score: 70, latency_ms: 80 },
+    { proxy_ip: 'backup-b', country: 'TW', exit_country: 'TW', supports_ipv4: 1, enabled: 1, health_status: 'healthy', health_score: 80, latency_ms: 120 }
+  ], 'current', now, 'TW');
   assert.equal(selected.proxy_ip, 'backup-b');
 });
 

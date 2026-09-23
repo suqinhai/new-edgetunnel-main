@@ -80,6 +80,12 @@ function createDatabase(t) {
   for (const file of readdirSync(migrations).filter(name => name.endsWith('.sql')).sort()) {
     db.exec(readFileSync(new URL(file, migrations), 'utf8'));
   }
+  // 生产 Worker 会在旧数据库上先检查表结构，再幂等补齐这些运行时兼容字段。
+  db.exec(`ALTER TABLE proxy_ip_pool ADD COLUMN ip_stack TEXT NOT NULL DEFAULT 'unknown';
+    ALTER TABLE proxy_ip_pool ADD COLUMN supports_ipv4 INTEGER;
+    ALTER TABLE proxy_ip_pool ADD COLUMN supports_ipv6 INTEGER;
+    ALTER TABLE proxy_ip_pool ADD COLUMN exit_ip TEXT;
+    ALTER TABLE proxy_ip_pool ADD COLUMN exit_country TEXT;`);
   // 使用真实 SQLite 执行生产 SQL；异步边界允许读写交错。
   const DB = {
     prepare(sql) {
@@ -741,7 +747,7 @@ for (const resetStage of ['beforeAdmission', 'afterAdmission', 'afterValidation'
   test(`计时重置与激活交错仍拒绝或断开旧连接（${resetStage}）`, { timeout: 3000 }, async t => {
     const { db, DB } = createDatabase(t);
     insertLink(db, null, null);
-    db.prepare("INSERT INTO proxy_ip_pool(country, proxy_ip, created_at) VALUES ('TW', '203.0.113.11', ?)").run(Date.now());
+    db.prepare("INSERT INTO proxy_ip_pool(country, proxy_ip, created_at, health_status, supports_ipv4, exit_ip, exit_country) VALUES ('TW', '203.0.113.11', ?, 'healthy', 1, '203.0.113.12', 'TW')").run(Date.now());
     const context = { 记录: db.prepare('SELECT * FROM access_links WHERE id = 1').get(), env: { DB },
       clientIP: '', request: new Request('https://worker.example/') };
     const reset = () => __test.执行访问链接操作({ session: DB, env: { DB }, request: context.request,
@@ -813,7 +819,7 @@ for (const leaseState of ['deleted', 'expired', 'valid']) {
   test(`访问心跳只续订仍有效的租约（${leaseState}）`, { timeout: 3000 }, async t => {
     const { db, DB } = createDatabase(t);
     insertLink(db, null, null);
-    db.prepare("INSERT INTO proxy_ip_pool(country, proxy_ip, created_at) VALUES ('TW', '203.0.113.11', ?)").run(Date.now());
+    db.prepare("INSERT INTO proxy_ip_pool(country, proxy_ip, created_at, health_status, supports_ipv4, exit_ip, exit_country) VALUES ('TW', '203.0.113.11', ?, 'healthy', 1, '203.0.113.12', 'TW')").run(Date.now());
     const context = { 记录: db.prepare('SELECT * FROM access_links WHERE id = 1').get(), env: { DB },
       clientIP: '', request: new Request('https://worker.example/') };
     let check;
@@ -856,7 +862,7 @@ for (const rotationStage of ['beforeActivation', 'beforeAdmission', 'unchanged']
   test(`XHTTP 激活时校验请求 UUID（${rotationStage}）`, { timeout: 3000 }, async t => {
     const { db, DB } = createDatabase(t);
     insertLink(db, null, null);
-    db.prepare("INSERT INTO proxy_ip_pool(country, proxy_ip, created_at) VALUES ('TW', '203.0.113.11', ?)").run(Date.now());
+    db.prepare("INSERT INTO proxy_ip_pool(country, proxy_ip, created_at, health_status, supports_ipv4, exit_ip, exit_country) VALUES ('TW', '203.0.113.11', ?, 'healthy', 1, '203.0.113.12', 'TW')").run(Date.now());
     const record = db.prepare('SELECT * FROM access_links WHERE id = 1').get();
     const env = { DB };
     const context = { 记录: record, env, clientIP: '', request: new Request('https://worker.example/') };

@@ -122,7 +122,8 @@
 | **KEY** | ❌ | `CMLiussss` | 快速订阅路径密钥，访问 `/CMLiussss` 即可快速获取节点 |
 | **UUID** | ❌ | `90cd4a77-141a-43c9-991b-08263cfe9c10` | 强制固定UUID，只支持**UUIDv4**标准格式 |
 | **PROXYIP** | ❌ | `proxyip.cmliussss.net:443` | 全局自定义反代 IP  |
-| **FORCE_IPV4** | ❌ | `true` | 强制 IPv4 出口；PROXYIP 健康检测必须确认支持 IPv4，连接时只拨号 IPv4 地址，不回退到 IPv6。关闭时设为 `false`。 |
+| **FORCE_IPV4** | ❌ | `true` | 兼容旧配置的连接栈开关。限时访问和国家中继始终只分配已确认支持 IPv4 且真实出口国家匹配的 PROXYIP。 |
+| **PROXYIP_GEOIP_URL** | ❌ | `https://ipwho.is/` | 出口 IP GeoIP 服务。服务需要接受 `/{ip}` 并返回 `country_code`；仅用于确认真实出口国家。 |
 | **URL** | ❌ | `https://cloudflare-error-page-3th.pages.dev` | 默认主页伪装地址（可填写网页 URL 或 `1101`） |
 | **GO2SOCKS5** | ❌ | `blog.cmliussss.com`,`*.ip111.cn`,`*google.com` | 强制走 SOCKS5 的名单 (`*` 为全局，域名用逗号分隔) |
 | **DEBUG** | ❌ | `1`或`true` | **开发者模式**，默认关闭调试日志功能（console.log），设置`1`或`true`则开启调试日志功能 |
@@ -153,7 +154,7 @@
 
 ## 🔐 ChatGPT checkout 国家中继
 
-`POST /internal/chatgpt/checkout` 是一个只供服务端调用的受保护接口。它仅能请求固定目标 `https://chatgpt.com/backend-api/payments/checkout`，不接受 URL、hostname、port 或 target。请求会按 `country` 从 D1 `proxy_ip_pool` 中选择未隔离、健康分高、延迟低的同国家 PROXYIP；没有候选时会强制同步一次该国家数据源后重查。
+`POST /internal/chatgpt/checkout` 是一个只供服务端调用的受保护接口。它仅能请求固定目标 `https://chatgpt.com/backend-api/payments/checkout`，不接受 URL、hostname、port 或 target。请求只会选择同时满足 `supports_ipv4 = 1`、`health_status = 'healthy'`、`exit_country = country` 的同国家 PROXYIP；没有匹配出口时返回“该国家暂无可用出口”，不会回退到其他国家或仅有国家标签的记录。
 
 该接口必须绑定名为 `DB` 的 D1 数据库，并先应用 `0006_chatgpt_relay.sql`。生产密钥使用：
 
@@ -261,6 +262,8 @@ npx wrangler deploy
 - `0004_proxy_health.sql`：健康评分、连续失败、冷却、真实流量结果和国家阈值。
 - `0005_admin_security_audit.sql`：随机管理员会话、登录限速、审计日志、通知去重和 schema 元数据。
 - `0006_chatgpt_relay.sql`：ChatGPT checkout 中继 nonce hash 防重放与按来源限流状态。
+
+PROXYIP 的 IPv4 能力、真实出口 IP 和出口国家字段由运行时先检查表结构、再为旧数据库补齐，避免已由旧 Worker 补列的数据库执行重复 `ALTER TABLE`。
 
 使用 Pages 部署时，也可以在 Cloudflare 控制台为项目添加绑定名为 `DB` 的 D1 数据库。请在 D1 控制台执行迁移，或从本地使用 Wrangler 对同一数据库执行迁移，然后重新部署。运行时仍会兼容旧版“首次访问自动补表”，但正式部署应以 migration 记录为准。
 

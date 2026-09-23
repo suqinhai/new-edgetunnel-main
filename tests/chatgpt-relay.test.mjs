@@ -14,6 +14,12 @@ function createDatabase(t) {
   for (const file of readdirSync(migrations).filter(name => name.endsWith('.sql')).sort()) {
     db.exec(readFileSync(new URL(file, migrations), 'utf8'));
   }
+  // 生产 Worker 会在旧数据库上先检查表结构，再幂等补齐这些运行时兼容字段。
+  db.exec(`ALTER TABLE proxy_ip_pool ADD COLUMN ip_stack TEXT NOT NULL DEFAULT 'unknown';
+    ALTER TABLE proxy_ip_pool ADD COLUMN supports_ipv4 INTEGER;
+    ALTER TABLE proxy_ip_pool ADD COLUMN supports_ipv6 INTEGER;
+    ALTER TABLE proxy_ip_pool ADD COLUMN exit_ip TEXT;
+    ALTER TABLE proxy_ip_pool ADD COLUMN exit_country TEXT;`);
   const DB = {
     prepare(sql) {
       const statement = db.prepare(sql);
@@ -79,10 +85,12 @@ async function signedRequest(body, { timestamp = Date.now().toString(), nonce = 
 }
 
 function insertProxy(db, overrides = {}) {
-  const row = { country: 'SG', proxy_ip: 'proxy.example:443', health_status: 'healthy', health_score: 90, latency_ms: 20, ...overrides };
-  db.prepare(`INSERT INTO proxy_ip_pool(country, proxy_ip, enabled, created_at, health_status, health_score, latency_ms, updated_at)
-    VALUES (?, ?, 1, ?, ?, ?, ?, ?)`)
-    .run(row.country, row.proxy_ip, Date.now(), row.health_status, row.health_score, row.latency_ms, Date.now());
+  const row = { country: 'SG', proxy_ip: 'proxy.example:443', health_status: 'healthy', health_score: 90, latency_ms: 20,
+    supports_ipv4: 1, exit_ip: '152.42.217.76', exit_country: 'SG', ...overrides };
+  db.prepare(`INSERT INTO proxy_ip_pool(country, proxy_ip, enabled, created_at, health_status, health_score, latency_ms,
+    supports_ipv4, exit_ip, exit_country, updated_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(row.country, row.proxy_ip, Date.now(), row.health_status, row.health_score, row.latency_ms,
+      row.supports_ipv4, row.exit_ip, row.exit_country, Date.now());
 }
 
 const successTransport = async () => ({
@@ -196,19 +204,99 @@ test('没有健康代理时强制同步该国家数据源后重新选择', async
     VALUES ('builtin-disabled', 'https://zip.cm.edu.kg.cmliussss.net/all.json', '', 0, 60, 100, 'never', ?, ?),
            ('test-source', 'https://source.example/proxies', 'SG', 1, 60, 100, 'never', ?, ?)`)
     .run(now, now, now, now);
-  let synced = 0, selectedProxy = '';
+  let synced = 0, detected = 0, geoLookups = 0, selectedProxy = '';
   t.mock.method(globalThis, 'fetch', async url => {
-    assert.equal(String(url), 'https://source.example/proxies');
-    synced++;
-    return new Response('fresh-proxy.example:443', { headers: { 'Content-Type': 'text/plain' } });
+    const href = String(url);
+    if (href === 'https://source.example/proxies') {
+      synced++;
+      return new Response('fresh-proxy.example:443', { headers: { 'Content-Type': 'text/plain' } });
+    }
+    if (href.startsWith('https://api.090227.xyz/check?proxyip=')) {
+      detected++;
+      return Response.json({ success: true, responseTime: 12, inferred_stack: 'ipv4_only', supports_ipv4: true,
+        supports_ipv6: false, probe_results: { ipv4: { ok: true, exit: { ip: '152.42.217.76' } } } });
+    }
+    if (href === 'https://geo.example/152.42.217.76') {
+      geoLookups++;
+      return Response.json({ country_code: 'SG' });
+    }
+    throw new Error(`unexpected fetch ${href}`);
   });
-  const response = await __test.处理ChatGPTCheckout中继(await signedRequest(validBody()), { DB, RADAR_RELAY_SECRET: secret }, {}, async (_request, proxy) => {
+  const response = await __test.处理ChatGPTCheckout中继(await signedRequest(validBody()), {
+    DB, RADAR_RELAY_SECRET: secret, PROXYIP_GEOIP_URL: 'https://geo.example/{ip}'
+  }, {}, async (_request, proxy) => {
     selectedProxy = proxy;
     return successTransport();
   });
   assert.equal(response.status, 200);
   assert.equal(synced, 1);
+  assert.equal(detected, 1);
+  assert.equal(geoLookups, 1);
   assert.equal(selectedProxy, 'fresh-proxy.example:443');
+  assert.deepEqual({ ...db.prepare('SELECT supports_ipv4, exit_ip, exit_country, health_status FROM proxy_ip_pool').get() }, {
+    supports_ipv4: 1, exit_ip: '152.42.217.76', exit_country: 'SG', health_status: 'healthy'
+  });
+});
+
+test('候选只接受健康 IPv4 且真实出口国家匹配的记录', async t => {
+  const { db, DB } = createDatabase(t);
+  insertProxy(db, { proxy_ip: 'valid.example:443' });
+  insertProxy(db, { proxy_ip: 'wrong-country.example:443', exit_country: 'TW', health_score: 100 });
+  insertProxy(db, { proxy_ip: 'country-label-only.example:443', supports_ipv4: null, exit_ip: null, exit_country: null, health_score: 100 });
+  insertProxy(db, { proxy_ip: 'unhealthy.example:443', health_status: 'unhealthy', health_score: 100 });
+  const candidates = (await __test.查询健康访问代理候选(DB, 'SG', '', Date.now())).results;
+  assert.deepEqual(candidates.map(item => item.proxy_ip), ['valid.example:443']);
+});
+
+test('没有真实国家匹配出口时返回固定错误且不调用中继', async t => {
+  const { db, DB } = createDatabase(t);
+  insertProxy(db, { proxy_ip: 'wrong-country.example:443', exit_country: 'TW', last_checked_at: Date.now() });
+  let transports = 0;
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ success: false }));
+  const response = await __test.处理ChatGPTCheckout中继(await signedRequest(validBody()), {
+    DB, RADAR_RELAY_SECRET: secret
+  }, {}, async () => { transports++; return successTransport(); });
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).message, '该国家暂无可用出口');
+  assert.equal(transports, 0);
+});
+
+test('GeoIP 查询失败仍保存检测取得的真实出口 IP 并拒绝分配', async t => {
+  const { db, DB } = createDatabase(t);
+  insertProxy(db, { proxy_ip: 'probe.example:443', health_status: 'unknown', supports_ipv4: null, exit_ip: null, exit_country: null });
+  t.mock.method(globalThis, 'fetch', async url => {
+    if (String(url).startsWith('https://api.090227.xyz/check?proxyip=')) {
+      return Response.json({ success: true, inferred_stack: 'ipv4_only', supports_ipv4: true,
+        probe_results: { ipv4: { ok: true, exit: { ip: '198.51.100.8' } } } });
+    }
+    return new Response('unavailable', { status: 503 });
+  });
+  const result = await __test.检测访问PROXYIP池({ DB, PROXYIP_GEOIP_URL: 'https://geo.example/{ip}' }, 'SG', 1);
+  assert.equal(result.unavailable, 1);
+  const row = db.prepare("SELECT supports_ipv4, exit_ip, exit_country, health_status FROM proxy_ip_pool WHERE proxy_ip = 'probe.example:443'").get();
+  assert.equal(row.supports_ipv4, 1);
+  assert.equal(row.exit_ip, '198.51.100.8');
+  assert.equal(row.exit_country, null);
+  assert.equal(row.health_status, 'unhealthy');
+});
+
+test('真实出口国家不匹配时保存检测结果并拒绝作为候选', async t => {
+  const { db, DB } = createDatabase(t);
+  insertProxy(db, { proxy_ip: 'wrong-exit.example:443', health_status: 'unknown', supports_ipv4: null, exit_ip: null, exit_country: null });
+  t.mock.method(globalThis, 'fetch', async url => {
+    if (String(url).startsWith('https://api.090227.xyz/check?proxyip=')) {
+      return Response.json({ success: true, inferred_stack: 'ipv4_only', supports_ipv4: true,
+        probe_results: { ipv4: { ok: true, exit: { ip: '203.0.113.8' } } } });
+    }
+    return Response.json({ country_code: 'TW' });
+  });
+  const result = await __test.检测访问PROXYIP池({ DB, PROXYIP_GEOIP_URL: 'https://geo.example/{ip}' }, 'SG', 1);
+  assert.equal(result.failed, 1);
+  assert.deepEqual({ ...db.prepare("SELECT exit_ip, exit_country, health_status FROM proxy_ip_pool WHERE proxy_ip = 'wrong-exit.example:443'").get() }, {
+    exit_ip: '203.0.113.8', exit_country: 'TW', health_status: 'unhealthy'
+  });
+  const candidates = (await __test.查询健康访问代理候选(DB, 'SG', '', Date.now())).results;
+  assert.equal(candidates.length, 0);
 });
 
 test('代理网络错误记录失败并返回通用错误', async t => {
