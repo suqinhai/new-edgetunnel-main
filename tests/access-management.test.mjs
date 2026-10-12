@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { __test } from '../_worker.js';
+import { verifiedProxy } from './helpers/country-probe.mjs';
 
 const base = (overrides = {}) => ({
   id: 1,
   token: 'x'.repeat(43),
   uuid: '00000000-0000-4000-8000-000000000000',
   status: 'active',
+  country: 'TW',
   duration_seconds: 3600,
   first_used_at: null,
   expires_at: null,
@@ -245,6 +247,7 @@ test('XHTTP 上传结束后保留租约直到下行连接结束', async () => {
   };
   const record = base({ expires_at: Date.now() + 60_000 });
   const context = { 记录: record, env: { DB }, 激活任务: Promise.resolve(record), leaseId: 'lease-1', 代理连接成功: true, 已释放: false };
+  context.已验证代理候选 = [verifiedProxy()];
   context.反代上下文 = { 反代IP: '203.0.113.11', 启用反代兜底: false, 启用SOCKS5反代: null, 访问授权上下文: context };
   const request = {
     body: new ReadableStream({ start(controller) { controller.enqueue(requestHeader); controller.close(); } }),

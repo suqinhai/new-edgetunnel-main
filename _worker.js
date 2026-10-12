@@ -1,5 +1,5 @@
 const Version = '2026-05-17 18:52:03';
-const 访问管理增强版本 = '2026-09-11 00:00:00';
+const 访问管理增强版本 = '2026-10-10 00:00:00';
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓存反代数组索引 = 0, 启用反代兜底 = true, 调试日志打印 = false;
 let 访问数据库初始化任务 = null;
@@ -953,7 +953,12 @@ async function 确保访问数据库(env) {
 			const 补充缺失列 = async (table, columns) => {
 				const result = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
 				const existing = new Set((result.results || []).map(item => item.name));
-				for (const [name, definition] of columns) if (!existing.has(name)) await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`).run();
+				let added = false;
+				for (const [name, definition] of columns) if (!existing.has(name)) {
+					await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`).run();
+					added = true;
+				}
+				return added;
 			};
 			await 补充缺失列('access_links', [
 				['connection_count', 'INTEGER NOT NULL DEFAULT 0'],
@@ -983,6 +988,11 @@ async function 确保访问数据库(env) {
 				['real_failure_count', 'INTEGER NOT NULL DEFAULT 0'],
 				['last_real_failure', 'INTEGER']
 			]);
+			const 国家出口升级 = await 补充缺失列('proxy_ip_pool', [
+				['exit_country', 'TEXT'], ['exit_ip', 'TEXT'], ['country_verified_at', 'INTEGER'],
+				['country_error', "TEXT NOT NULL DEFAULT ''"]
+			]);
+			if (国家出口升级) await env.DB.prepare('UPDATE access_links SET proxy_ip = NULL, connection_epoch = connection_epoch + 1').run();
 			await 补充缺失列('proxy_ip_sources', [
 				['consecutive_failures', 'INTEGER NOT NULL DEFAULT 0'],
 				['sync_lock', 'TEXT'],
@@ -993,8 +1003,8 @@ async function 确保访问数据库(env) {
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_health ON proxy_ip_pool(country, enabled, health_status, failure_count)'),
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_pool_score ON proxy_ip_pool(country, enabled, cooldown_until, health_score)'),
 				env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_access_links_tags ON access_links(tags)'),
-				env.DB.prepare(`INSERT INTO schema_metadata(key, value, updated_at) VALUES ('access_management_schema', '5', ?1)
-					ON CONFLICT(key) DO UPDATE SET value = '5', updated_at = ?1`).bind(Date.now())
+				env.DB.prepare(`INSERT INTO schema_metadata(key, value, updated_at) VALUES ('access_management_schema', '6', ?1)
+						ON CONFLICT(key) DO UPDATE SET value = '6', updated_at = ?1`).bind(Date.now())
 			]);
 			const now = Date.now();
 			await env.DB.prepare(`INSERT OR IGNORE INTO proxy_ip_sources
@@ -1010,6 +1020,12 @@ async function 确保访问数据库(env) {
 
 function 获取访问数据库会话(env) {
 	return typeof env.DB.withSession === 'function' ? env.DB.withSession('first-primary') : env.DB;
+}
+
+async function 读取访问出口验证设置(session) {
+	const setting = await session.prepare('SELECT value FROM schema_metadata WHERE key = ?1')
+		.bind('skip_ipwho_is_verification').first();
+	return { skip_ipwho_is: setting?.value === 'true' };
 }
 
 async function 查询访问链接(env, token) {
@@ -1083,9 +1099,16 @@ async function 激活访问授权上下文(上下文) {
 			await 同步到期访问PROXYIP数据源(上下文.env, { country: 记录.country });
 			IP结果 = await 查询健康访问代理候选(session, 记录.country, 记录.proxy_ip);
 		}
-		const 候选反代IP = (IP结果.results || []).map(item => item.proxy_ip);
+		// 标签和旧健康状态均不能作为出口国家证明；每次真实连接重新检测。
+		const 已验证代理候选 = await 验证访问国家候选(上下文.env, IP结果.results || [], 记录.country);
+		const 候选反代IP = 已验证代理候选.map(item => item.proxy_ip);
 		const 选定反代IP = 候选反代IP[0] || null;
-		if (!选定反代IP) throw Object.assign(new Error(`国家 ${记录.country} 暂无健康且未隔离的 PROXYIP`), { status: 503 });
+		if (!选定反代IP) {
+			const reason = await 获取国家出口检测错误(session, 记录.country);
+			throw Object.assign(new Error(`${记录.country} 暂无通过实际出口国家验证的 PROXYIP，已拒绝连接${reason ? '；' + reason : '；请同步并检测该国家 IP 池'}`), { status: 503 });
+		}
+		上下文.已验证代理候选 = 已验证代理候选;
+		上下文.待验证代理候选 = (IP结果.results || []).slice((IP结果.results || []).findIndex(item => item.proxy_ip === 选定反代IP) + 1);
 
 		const now = Date.now(), 原反代IP = 记录.proxy_ip || null, leaseExpiresAt = now + 90000;
 		上下文.leaseId = crypto.randomUUID();
@@ -1514,32 +1537,50 @@ async function 解压访问PROXYIPZIP条目(buffer, names) {
 }
 
 async function 获取访问PROXYIP数据源内容(source, targetCountry = '') {
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), 20000);
-	try {
-		if (source.url === 内置访问PROXYIP数据源URL && targetCountry) {
+	const read = async (url, accept, types) => {
+		const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 20000);
+		try {
+			const response = await 安全获取访问数据源(url, { headers: { Accept: accept, 'User-Agent': 'edgetunnel-proxy-pool/1.0' }, signal: controller.signal }, 20 * 1024 * 1024, types);
+			return await 读取受限响应字节(response, 20 * 1024 * 1024);
+		} catch (error) {
+			if (error?.name === 'AbortError') throw new Error('数据源请求超时');
+			throw error;
+		} finally { clearTimeout(timer); }
+	};
+	let allError = '';
+	if (source.url === 内置访问PROXYIP数据源URL && targetCountry) {
+		try {
+			// all.json 是用户可见的权威列表；不要让可能滞后的 ip.zip 覆盖它。
+			return new TextDecoder().decode(await read(source.url, 'application/json,text/plain;q=0.9,*/*;q=0.1', ['application/json', 'text/', 'application/octet-stream']));
+		} catch (error) {
+			allError = String(error?.message || error);
+		}
+	}
+	// all.json 暂时不可用时才尝试 ZIP，避免短时源故障阻断同步。
+	if (source.url === 内置访问PROXYIP数据源URL && targetCountry && allError) {
+		try {
 			const zipUrl = source.url.replace(/\/all\.json$/i, '/ip.zip');
-			const response = await 安全获取访问数据源(zipUrl, { headers: { Accept: 'application/zip,*/*;q=0.1', 'User-Agent': 'edgetunnel-proxy-pool/1.0' }, signal: controller.signal }, 20 * 1024 * 1024, ['application/zip', 'application/x-zip-compressed', 'application/octet-stream', 'binary/octet-stream']);
-			const bytes = await 读取受限响应字节(response, 20 * 1024 * 1024);
-			const buffer = bytes.buffer;
+			const bytes = await read(zipUrl, 'application/zip,*/*;q=0.1', ['application/zip', 'application/x-zip-compressed', 'application/octet-stream', 'binary/octet-stream']);
 			const ports = [443, 8443, 2053, 2083, 2087, 2096];
-			const names = ports.map(port => `${port}/${targetCountry}.txt`);
-			const files = await 解压访问PROXYIPZIP条目(buffer, names);
+			const files = await 解压访问PROXYIPZIP条目(bytes.buffer, ports.map(port => `${port}/${targetCountry}.txt`));
 			const parts = [];
 			for (const port of ports) {
 				const file = files.get(`${port}/${targetCountry}.txt`);
 				if (!file) continue;
 				for (const line of file.split(/\r?\n/).map(item => item.trim()).filter(Boolean)) parts.push(port === 443 || line.includes(':') ? line : `${line}:${port}`);
 			}
-			return parts.join('\n');
+			if (parts.length) return parts.join('\n');
+			throw new Error(`ZIP 中没有 ${targetCountry} 国家文件`);
+		} catch (error) {
+			throw new Error(`内置列表同步失败：all.json：${allError}；ip.zip：${error?.message || error}`);
 		}
-		const response = await 安全获取访问数据源(source.url, { headers: { Accept: 'application/json,text/plain,text/csv;q=0.9,*/*;q=0.1', 'User-Agent': 'edgetunnel-proxy-pool/1.0' }, signal: controller.signal }, 20 * 1024 * 1024, ['application/json', 'text/', 'application/csv', 'application/octet-stream']);
-		const text = new TextDecoder().decode(await 读取受限响应字节(response, 20 * 1024 * 1024));
-		return text;
+	}
+	try {
+		return new TextDecoder().decode(await read(source.url, 'application/json,text/plain,text/csv;q=0.9,*/*;q=0.1', ['application/json', 'text/', 'application/csv', 'application/octet-stream']));
 	} catch (error) {
-		if (error?.name === 'AbortError') throw new Error('数据源请求超时');
+		if (allError) throw new Error(`内置列表同步失败：all.json：${allError}；${error?.message || error}`);
 		throw error;
-	} finally { clearTimeout(timer); }
+	}
 }
 
 async function 同步单个访问PROXYIP数据源(env, source, targetCountry = '', 重置健康状态 = false) {
@@ -1569,6 +1610,8 @@ async function 同步单个访问PROXYIP数据源(env, source, targetCountry = '
 					consecutive_failures = CASE WHEN ?5 = 1 THEN 0 ELSE consecutive_failures END,
 					cooldown_until = CASE WHEN ?5 = 1 THEN NULL ELSE cooldown_until END,
 					last_error = CASE WHEN ?5 = 1 THEN '' ELSE last_error END,
+					country_verified_at = CASE WHEN ?5 = 1 THEN NULL ELSE country_verified_at END,
+					country_error = CASE WHEN ?5 = 1 THEN '' ELSE country_error END,
 					updated_at = ?3`)
 				.bind(entry.country, entry.proxy_ip, now, source.id, 重置健康状态 ? 1 : 0)));
 		}
@@ -1620,44 +1663,157 @@ async function 同步到期访问PROXYIP数据源(env, { force = false, country 
 	return summaries;
 }
 
+function 获取固定访问反代地址(value) {
+	const endpoint = 标准化访问PROXYIP(value);
+	let address;
+	try { address = new URL(`https://${endpoint}`); } catch (_) { throw new Error('国家出口验证需要有效的固定 IP 和端口'); }
+	if (!isIPHostname(address.hostname) || address.username || address.password || address.pathname !== '/' || address.search || address.hash) {
+		throw new Error('国家节点只接受固定 IP 地址，不能使用可能改变解析结果的域名');
+	}
+	const port = Number(address.port || 443);
+	if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PROXYIP 端口无效');
+	return { hostname: address.hostname, port, endpoint: address.hostname + (port === 443 ? '' : `:${port}`) };
+}
+
+function 校验访问代理出口检测(data, country, proxyIP) {
+	const expected = 获取固定访问反代地址(proxyIP);
+	if (data?.success !== true) throw Object.assign(new Error('PROXYIP 无法连通，不能确认出口国家'), { code: 'probe_failed' });
+	const measuredHost = String(data.proxyIP || '');
+	const measured = 获取固定访问反代地址((measuredHost.includes(':') ? `[${stripIPv6Brackets(measuredHost)}]` : measuredHost) + (Number(data.portRemote) === 443 ? '' : `:${data.portRemote}`));
+	if (measured.endpoint !== expected.endpoint) throw new Error('检测结果对应的代理地址或端口与候选不一致');
+	const probes = data.probe_results;
+	if (!probes || typeof probes !== 'object') throw new Error('检测服务未返回实际出口信息，已拒绝使用');
+	const exits = [];
+	for (const stack of ['ipv4', 'ipv6']) {
+		const probe = probes[stack];
+		if (data[`supports_${stack}`] === true && probe?.ok !== true) throw new Error(`${stack} 出口缺少成功的检测证据`);
+		if (probe?.ok !== true) continue;
+		const exit = probe.exit;
+		if (!exit || !isIPHostname(String(exit.ip || '')) || !/^[A-Z]{2}$/.test(String(exit.country || ''))) throw new Error('检测服务返回的出口 IP 或国家无效');
+		if (exit.country !== country) throw Object.assign(new Error(`出口国家不符：要求 ${country}，实际 ${exit.country}（${exit.ip}）`), {
+			code: 'country_mismatch', exit_country: exit.country, exit_ip: exit.ip
+		});
+		exits.push({ ip: exit.ip, country: exit.country });
+	}
+	if (!exits.length) throw new Error('没有任何可确认国家的实际出口，已拒绝使用');
+	return exits;
+}
+
+async function 请求访问出口检测JSON(url, label) {
+	// 检测接口的 429、5xx 和网络超时可以重试；国家不符在调用方立即拒绝。
+	for (let attempt = 0; attempt < 2; attempt++) {
+		const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 6000);
+		try {
+			const response = await fetch(url, { signal: controller.signal, headers: { Accept: 'application/json' }, cache: 'no-store' });
+			if (!response.ok) throw Object.assign(new Error(`${label} HTTP ${response.status}`), { retryable: response.status === 429 || response.status >= 500 });
+			return await response.json();
+		} catch (error) {
+			if (attempt === 0 && error?.retryable !== false && !(error instanceof SyntaxError)) continue;
+			if (error?.name === 'AbortError') throw new Error(`${label}请求超时（已重试）`);
+			throw new Error(`${label}失败：${error?.message || error}`);
+		} finally { clearTimeout(timer); }
+	}
+}
+
+async function 验证访问代理出口(env, candidate, country) {
+	try {
+		const endpoint = 获取固定访问反代地址(candidate.proxy_ip).endpoint;
+		const data = await 请求访问出口检测JSON(访问PROXYIP检测URL + encodeURIComponent(endpoint), '出口检测服务');
+		const exits = 校验访问代理出口检测(data, country, endpoint);
+		const verification = await 读取访问出口验证设置(获取访问数据库会话(env));
+		// 交叉核验实测出口，而不是查询数据源标签或 Worker 自己的出口。
+		for (const exit of verification.skip_ipwho_is ? [] : exits) {
+			// ipwho.is 的 fields 参数偶发返回 404；完整响应同样包含所需字段且更稳定。
+			const geo = await 请求访问出口检测JSON(`https://ipwho.is/${encodeURIComponent(exit.ip)}`, '出口国家查询');
+			if (geo.success !== true || String(geo.ip || '').toLowerCase() !== exit.ip.toLowerCase() || !/^[A-Z]{2}$/.test(String(geo.country_code || ''))) {
+				throw new Error(`出口国家查询未返回有效结果：${String(geo.message || geo.error || '缺少匹配的 IP 和国家').slice(0, 100)}`);
+			}
+			if (geo.country_code !== country) {
+				throw Object.assign(new Error(`出口国家交叉核验未通过：要求 ${country}，查询结果 ${geo.country_code || '未知'}`), {
+					code: 'country_mismatch', exit_country: geo.country_code || null, exit_ip: exit.ip
+				});
+			}
+		}
+		const verified = { proxy_ip: candidate.proxy_ip, exit_country: country,
+			exit_ip: [...new Set(exits.map(exit => exit.ip))].join(', '), country_verified_at: Date.now() };
+		await env.DB.prepare(`UPDATE proxy_ip_pool SET exit_country = ?1, exit_ip = ?2, country_verified_at = ?3,
+			country_error = '', health_status = 'healthy', latency_ms = ?4, failure_count = 0, consecutive_failures = 0,
+			cooldown_until = NULL, health_score = MIN(100, health_score + 8), last_checked_at = ?3,
+			last_success_at = ?3, last_error = '' WHERE id = ?5 AND country = ?1 AND proxy_ip = ?6`)
+			.bind(country, verified.exit_ip, verified.country_verified_at, Math.max(0, Math.round(Number(data.responseTime) || 0)), candidate.id, candidate.proxy_ip).run();
+		return verified;
+	} catch (error) {
+		const now = Date.now(), message = String(error?.message || error).slice(0, 200);
+		const isolate = ['country_mismatch', 'probe_failed'].includes(error?.code);
+		await env.DB.prepare(`UPDATE proxy_ip_pool SET exit_country = ?1, exit_ip = ?2, country_verified_at = NULL,
+			country_error = ?3, health_status = ?9, cooldown_until = ?4, last_checked_at = ?5,
+			last_error = ?3, failure_count = failure_count + 1, consecutive_failures = consecutive_failures + 1,
+			health_score = MAX(0, health_score - 15) WHERE id = ?6 AND country = ?7 AND proxy_ip = ?8`)
+			.bind(error?.exit_country || null, error?.exit_ip || null, message, isolate ? now + 30 * 60000 : null, now, candidate.id, country, candidate.proxy_ip, isolate ? 'unhealthy' : 'unknown').run();
+		throw error;
+	}
+}
+
+async function 验证访问国家候选(env, candidates, country) {
+	// 通常只需验证已分配地址；备用仅在实际失败时验证，避免每个连接检测整个池。
+	for (const candidate of candidates) {
+		try { return [await 验证访问代理出口(env, candidate, country)]; } catch (_) { }
+	}
+	return [];
+}
+
+async function 获取已验证国家池状态(session, country) {
+	return await session.prepare(`SELECT COUNT(*) AS healthy, 0 AS unknown FROM proxy_ip_pool
+		WHERE country = ?1 AND enabled = 1 AND health_status = 'healthy' AND exit_country = ?1
+			AND country_verified_at >= ?2 AND (cooldown_until IS NULL OR cooldown_until <= ?3)`)
+		.bind(country, Date.now() - 5 * 60000, Date.now()).first();
+}
+
+async function 获取国家出口检测错误(session, country) {
+	const result = await session.prepare(`SELECT proxy_ip, country_error FROM proxy_ip_pool
+		WHERE country = ?1 AND enabled = 1 AND country_error <> '' ORDER BY last_checked_at DESC LIMIT 3`).bind(country).all();
+	return (result.results || []).map(item => `${item.proxy_ip}：${item.country_error}`).join('；');
+}
+
+function 校验国家出口连接配置(context, config, now = Date.now()) {
+	const country = context.记录?.country;
+	const evidence = context.已验证代理候选 || [];
+	if (!country || !evidence.length || config.启用SOCKS5反代) throw new Error('国家节点缺少已验证的出口配置，已拒绝连接');
+	const allowed = new Set(evidence.filter(item => item.exit_country === country && item.exit_ip
+		&& Number(item.country_verified_at) <= now && now - Number(item.country_verified_at) <= 60000)
+		.map(item => 获取固定访问反代地址(item.proxy_ip).endpoint));
+	const endpoints = String(config.反代IP || '').split(',').filter(Boolean).map(item => 获取固定访问反代地址(item).endpoint);
+	if (!endpoints.length || endpoints.some(endpoint => !allowed.has(endpoint))) throw new Error('代理出口国家未验证、验证已过期或备用地址国家不符，已拒绝连接');
+}
+
 async function 检测访问PROXYIP池(env, country, limit = 8) {
 	const checkedAt = Date.now();
 	const result = await env.DB.prepare(`SELECT * FROM proxy_ip_pool
 		WHERE country = ?1 AND enabled = 1
 			AND (cooldown_until IS NULL OR cooldown_until <= ?3)
-			AND (health_status <> 'healthy' OR last_checked_at IS NULL OR last_checked_at < ?2)
-		ORDER BY CASE health_status WHEN 'unknown' THEN 0 WHEN 'unhealthy' THEN 1 ELSE 2 END, health_score ASC, RANDOM()
-		LIMIT ?4`).bind(country, checkedAt - 6 * 3600000, checkedAt, Math.min(24, Math.max(1, Number(limit) || 8))).all();
+			AND (health_status <> 'healthy' OR last_checked_at IS NULL OR last_checked_at < ?2
+				OR country_verified_at IS NULL OR exit_country <> ?1)
+		ORDER BY CASE WHEN source_id = (SELECT id FROM proxy_ip_sources WHERE url = ?4 LIMIT 1) THEN 0 ELSE 1 END,
+			CASE health_status WHEN 'unknown' THEN 0 WHEN 'unhealthy' THEN 1 ELSE 2 END, health_score ASC, RANDOM()
+		LIMIT ?5`).bind(country, checkedAt - 5 * 60000, checkedAt, 内置访问PROXYIP数据源URL, Math.min(24, Math.max(1, Number(limit) || 8))).all();
 	const candidates = result.results || [];
 	let success = 0, failed = 0, unavailable = 0, cursor = 0;
+	const errors = [];
 	const worker = async () => {
 		while (cursor < candidates.length) {
 			const candidate = candidates[cursor++];
-			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), 8000);
 			try {
-				const endpoint = String(candidate.proxy_ip).replace(/:443$/, '');
-				const response = await fetch(访问PROXYIP检测URL + encodeURIComponent(endpoint), { signal: controller.signal, headers: { Accept: 'application/json' } });
-				if (!response.ok) throw new Error(`检测服务 HTTP ${response.status}`);
-				const data = await response.json();
-				if (data.success) {
-					success++;
-					await env.DB.prepare(`UPDATE proxy_ip_pool SET health_status = 'healthy', latency_ms = ?1,
-						failure_count = 0, consecutive_failures = 0, cooldown_until = NULL,
-						health_score = MIN(100, health_score + 8), last_checked_at = ?2, last_success_at = ?2, last_error = '' WHERE id = ?3`)
-						.bind(Math.max(0, Math.round(Number(data.responseTime) || 0)), checkedAt, candidate.id).run();
-				} else {
-					failed++;
-					await 记录访问PROXYIP结果(env, { country, proxyIP: candidate.proxy_ip, success: false, real: false, error: 'PROXYIP 检测失败', checkedAt });
-				}
+				await 验证访问代理出口(env, candidate, country);
+				success++;
 			} catch (error) {
-				unavailable++;
-				await 记录访问PROXYIP结果(env, { country, proxyIP: candidate.proxy_ip, success: false, real: false, error: String(error?.message || error), checkedAt });
-			} finally { clearTimeout(timer); }
+				if (['country_mismatch', 'probe_failed'].includes(error?.code)) failed++;
+				else unavailable++;
+				errors.push({ proxy_ip: candidate.proxy_ip, error: String(error?.message || error).slice(0, 200) });
+			}
 		}
 	};
-	await Promise.all(Array.from({ length: Math.min(4, candidates.length) }, worker));
-	return { checked: candidates.length, success, failed, unavailable };
+	await Promise.all(Array.from({ length: Math.min(2, candidates.length) }, worker));
+	return { checked: candidates.length, success, failed, unavailable, errors };
 }
 
 async function 记录访问PROXYIP结果(env, { country, proxyIP, success, real = true, latency = null, error = '', checkedAt = Date.now() }) {
@@ -1753,6 +1909,7 @@ async function 发送管理通知(env, eventKey, title, payload, cooldownSeconds
 async function 检查访问管理通知(env) {
 	const now = Date.now(), defaultMinimum = Math.min(100, Math.max(1, Number(env.MIN_HEALTHY_IPS_PER_COUNTRY) || 3));
 	const low = await env.DB.prepare(`SELECT l.country, COUNT(DISTINCT CASE WHEN p.enabled = 1 AND p.health_status = 'healthy'
+		AND p.exit_country = p.country AND p.country_verified_at >= ?1 - 300000
 		AND (p.cooldown_until IS NULL OR p.cooldown_until <= ?1) THEN p.id END) AS healthy,
 		COALESCE(c.min_healthy_ips, ?2) AS minimum
 		FROM access_links l LEFT JOIN proxy_ip_pool p ON p.country = l.country
@@ -1841,12 +1998,12 @@ async function 执行访问链接操作({ session, env, request, adminSession, i
 		]);
 		关闭本实例链接连接(id);
 	} else if (action === 'reassign') {
-		const candidate = await session.prepare(`SELECT proxy_ip FROM proxy_ip_pool WHERE country = ?1 AND enabled = 1
-			AND proxy_ip <> COALESCE(?2, '') AND (cooldown_until IS NULL OR cooldown_until <= ?3)
-			AND health_status <> 'unhealthy' ORDER BY CASE health_status WHEN 'healthy' THEN 0 ELSE 1 END,
-			health_score DESC, latency_ms ASC, RANDOM() LIMIT 1`).bind(before.country, before.proxy_ip, now).first();
-		if (!candidate) throw new Error(`${before.country} 没有其他健康备用 PROXYIP`);
+		const 候选结果 = await 查询健康访问代理候选(session, before.country, before.proxy_ip, now);
+		const candidates = await 验证访问国家候选(env, (候选结果.results || []).filter(item => item.proxy_ip !== before.proxy_ip), before.country);
+		const candidate = candidates[0];
+		if (!candidate) throw new Error(`${before.country} 没有其他通过实际出口国家验证的 PROXYIP`);
 		result = await session.prepare('UPDATE access_links SET proxy_ip = ?1 WHERE id = ?2').bind(candidate.proxy_ip, id).run();
+		关闭本实例链接连接(id);
 	} else if (action === 'rotate') {
 		const mode = String(body.mode || 'both');
 		if (!['token', 'uuid', 'both'].includes(mode)) throw new Error('轮换类型无效');
@@ -2014,7 +2171,7 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			const tables = ['access_links', 'proxy_ip_pool', 'proxy_ip_sources', 'proxy_ip_source_sync', 'country_health_config'];
 			const data = {};
 			for (const table of tables) data[table] = (await session.prepare(`SELECT * FROM ${table}`).all()).results || [];
-			const content = JSON.stringify({ product: 'edgetunnel-access', schema_version: 5, exported_at: Date.now(), data }, null, 2);
+			const content = JSON.stringify({ product: 'edgetunnel-access', schema_version: 6, exported_at: Date.now(), data }, null, 2);
 			return new Response(content, { headers: { 'Content-Type': 'application/json;charset=utf-8', 'Content-Disposition': 'attachment; filename="edgetunnel-d1-backup.json"', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' } });
 		}
 
@@ -2050,8 +2207,12 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			const whereSQL = whereParts.length ? ` WHERE ${whereParts.join(' AND ')}` : '';
 			const limitParam = `?${whereParams.length + 1}`;
 			const offsetParam = `?${whereParams.length + 2}`;
-			const [链接结果, 筛选链接统计, IP结果, 统计结果, 数据源结果, 国家池结果, 二十四小时统计] = await Promise.all([
-				session.prepare(`SELECT * FROM access_links${whereSQL} ORDER BY id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`).bind(...whereParams, limit, offset).all(),
+			const [链接结果, 筛选链接统计, IP结果, 统计结果, 数据源结果, 国家池结果, 二十四小时统计, 出口验证设置] = await Promise.all([
+				session.prepare(`SELECT *,
+					(SELECT exit_ip FROM proxy_ip_pool p WHERE p.country = access_links.country AND p.proxy_ip = access_links.proxy_ip) AS exit_ip,
+					(SELECT exit_country FROM proxy_ip_pool p WHERE p.country = access_links.country AND p.proxy_ip = access_links.proxy_ip) AS exit_country,
+					(SELECT country_verified_at FROM proxy_ip_pool p WHERE p.country = access_links.country AND p.proxy_ip = access_links.proxy_ip) AS country_verified_at
+					FROM access_links${whereSQL} ORDER BY id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`).bind(...whereParams, limit, offset).all(),
 				session.prepare(`SELECT COUNT(*) AS total FROM access_links${whereSQL}`).bind(...whereParams).first(),
 				session.prepare(`SELECT p.*, COALESCE(s.name, '手动添加') AS source_name FROM proxy_ip_pool p
 					LEFT JOIN proxy_ip_sources s ON s.id = p.source_id ORDER BY p.country, p.id DESC LIMIT 500`).all(),
@@ -2064,8 +2225,10 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 					FROM access_links`).bind(now).first(),
 				session.prepare('SELECT * FROM proxy_ip_sources ORDER BY id').all(),
 				session.prepare(`SELECT p.country, COUNT(DISTINCT p.id) AS total,
-					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status <> 'unhealthy' THEN p.id END) AS available,
-					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status = 'healthy' THEN p.id END) AS healthy,
+					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status = 'healthy' AND exit_country = p.country
+						AND country_verified_at >= ?1 - 300000 AND (cooldown_until IS NULL OR cooldown_until <= ?1) THEN p.id END) AS available,
+					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status = 'healthy' AND exit_country = p.country
+						AND country_verified_at >= ?1 - 300000 AND (cooldown_until IS NULL OR cooldown_until <= ?1) THEN p.id END) AS healthy,
 					COUNT(DISTINCT CASE WHEN enabled = 1 AND health_status = 'unknown' THEN p.id END) AS unknown,
 					COUNT(DISTINCT CASE WHEN enabled = 1 AND (health_status = 'unhealthy' OR cooldown_until > ?1) THEN p.id END) AS isolated,
 					ROUND(AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END)) AS average_latency_ms,
@@ -2075,7 +2238,8 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 					FROM proxy_ip_pool p LEFT JOIN country_health_config c ON c.country = p.country
 					GROUP BY p.country ORDER BY p.country`).bind(now, Math.min(100, Math.max(1, Number(env.MIN_HEALTHY_IPS_PER_COUNTRY) || 3))).all(),
 				session.prepare(`SELECT COUNT(*) AS connections_24h,
-					SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures_24h FROM access_connection_events WHERE started_at >= ?1`).bind(now - 86400000).first()
+					SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures_24h FROM access_connection_events WHERE started_at >= ?1`).bind(now - 86400000).first(),
+				读取访问出口验证设置(session)
 			]);
 			const poolStats = 国家池结果.results || [];
 			const 总体统计 = 统计结果 || { total: 0, unused: 0, active: 0, expired: 0, revoked: 0, current_connections: 0 };
@@ -2095,6 +2259,7 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 				pools: IP结果.results || [],
 				sources: 数据源结果.results || [],
 				poolStats,
+				verification: 出口验证设置,
 				security: { session_expires_at: 管理员会话.expires_at, notifications_configured: !!env.NOTIFY_WEBHOOK_URL || !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) }
 			});
 		}
@@ -2104,6 +2269,24 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 		if (安全错误) return 安全错误;
 		if (!(request.headers.get('Content-Type') || '').toLowerCase().includes('application/json')) return 访问错误响应('Content-Type 必须是 application/json', 415);
 		const body = await request.json();
+
+		if (pathname === '/admin/access/api/health/settings') {
+			if (typeof body?.skipIpwhoIs !== 'boolean') throw new Error('跳过 ipwho.is 验证必须是布尔值');
+			const before = await 读取访问出口验证设置(session);
+			const verification = { skip_ipwho_is: body.skipIpwhoIs };
+			if (before.skip_ipwho_is !== verification.skip_ipwho_is) {
+				// 切换模式后重新检测，避免把上一个模式的健康记录算作当前模式已验证。
+				await env.DB.batch([
+					session.prepare(`INSERT INTO schema_metadata(key, value, updated_at) VALUES (?1, ?2, ?3)
+						ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+						.bind('skip_ipwho_is_verification', String(body.skipIpwhoIs), Date.now()),
+					session.prepare("UPDATE proxy_ip_pool SET country_verified_at = NULL, health_status = 'unknown' WHERE health_status = 'healthy'")
+				]);
+				await 写入审计日志(env, request, 管理员会话, 'proxy.verification.update', 'settings', 'skip_ipwho_is_verification', before, verification, true);
+			}
+			return 访问JSON响应({ success: true, verification,
+				message: `${body.skipIpwhoIs ? '已开启跳过 ipwho.is 验证' : '已恢复 ipwho.is 验证'}，请点击对应国家的“检测”更新健康状态` });
+		}
 
 		if (pathname === '/admin/access/api/session/logout-all') {
 			await session.prepare('UPDATE admin_sessions SET revoked_at = ?1 WHERE revoked_at IS NULL').bind(Date.now()).run();
@@ -2125,7 +2308,7 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 		}
 
 		if (pathname === '/admin/access/api/backup/restore') {
-			if (body?.product !== 'edgetunnel-access' || Number(body?.schema_version) !== 5 || !body?.data || typeof body.data !== 'object') throw new Error('备份 schema/version 不兼容');
+			if (body?.product !== 'edgetunnel-access' || ![5, 6].includes(Number(body?.schema_version)) || !body?.data || typeof body.data !== 'object') throw new Error('备份 schema/version 不兼容');
 			const overwrite = body.mode === 'overwrite';
 			if (overwrite && body.confirmOverwrite !== 'RESTORE OVERWRITE') throw new Error('覆盖恢复需要二次确认文本 RESTORE OVERWRITE');
 			const tableColumns = {
@@ -2197,28 +2380,22 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			if (!Number.isInteger(count) || count < 1 || count > 100) throw new Error('单次生成数量必须是 1 到 100');
 			if (!Number.isInteger(maxConcurrent) || maxConcurrent < 0 || maxConcurrent > 10000) throw new Error('并发上限必须是 0 到 10000');
 			if (!Number.isInteger(maxTotal) || maxTotal < 0 || maxTotal > 10000000) throw new Error('累计上限必须是 0 到 10000000');
-			await 同步到期访问PROXYIP数据源(env, { country });
-			let poolState = await session.prepare(`SELECT
-				SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
-				SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
-				FROM proxy_ip_pool WHERE country = ?1`).bind(country).first();
-			if (!Number(poolState?.healthy) && Number(poolState?.unknown)) {
+			let syncSummaries = await 同步到期访问PROXYIP数据源(env, { country });
+			let poolState = await 获取已验证国家池状态(session, country);
+			if (!Number(poolState?.healthy)) {
 				await 检测访问PROXYIP池(env, country, 8);
-				poolState = await session.prepare(`SELECT
-					SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
-					SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
-					FROM proxy_ip_pool WHERE country = ?1`).bind(country).first();
+				poolState = await 获取已验证国家池状态(session, country);
 			}
-			if (!Number(poolState?.healthy) && !Number(poolState?.unknown)) {
+			if (!Number(poolState?.healthy)) {
 				// 旧版本或短暂故障可能留下整国冷却状态；手动生成时强制同步并清除旧冷却，再做一次小批量检测。
-				await 同步到期访问PROXYIP数据源(env, { force: true, country });
+				syncSummaries = await 同步到期访问PROXYIP数据源(env, { force: true, country });
 				await 检测访问PROXYIP池(env, country, 8);
-				poolState = await session.prepare(`SELECT
-					SUM(CASE WHEN enabled = 1 AND health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy,
-					SUM(CASE WHEN enabled = 1 AND health_status = 'unknown' THEN 1 ELSE 0 END) AS unknown
-					FROM proxy_ip_pool WHERE country = ?1`).bind(country).first();
+				poolState = await 获取已验证国家池状态(session, country);
 			}
-			if (!Number(poolState?.healthy) && !Number(poolState?.unknown)) throw new Error(`${country} 暂无可用 PROXYIP，请同步数据源或稍后重试`);
+			if (!Number(poolState?.healthy)) {
+				const reason = await 获取国家出口检测错误(session, country) || syncSummaries.find(item => item.error)?.error;
+				throw new Error(`${country} 暂无通过实际出口国家验证的 PROXYIP；不会使用其他国家或未验证地址${reason ? '；' + reason : '，请同步并检测 IP 池'}`);
+			}
 			const durationSeconds = isPermanent ? 0 : durationHours * 3600;
 			const createdAt = Date.now();
 			const records = Array.from({ length: count }, (_, index) => ({
@@ -2236,7 +2413,7 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			await 写入审计日志(env, request, 管理员会话, 'access.create', 'access_link', 'batch', null, { count, country, duration_seconds: durationSeconds, limits: { maxConcurrent, maxTotal, bindFirstIP }, tags: 解析访问标签(tags) }, true);
 			const 基础配置 = await 读取config_JSON(env, host, userID, UA);
 			const created = records.map((record, index) => 格式化后台访问记录({ id: null, ...record, proxy_ip: null, status: 'active', created_at: createdAt, first_used_at: null, expires_at: null, last_used_at: null, connection_count: 0, active_connections: 0, bound_ip: null }, 基础配置, url.origin));
-			return 访问JSON响应({ success: true, message: `已生成 ${count} 条访问链接，${country} 池可用 ${Number(poolState?.healthy) + Number(poolState?.unknown)} 个 PROXYIP`, links: created }, 201);
+			return 访问JSON响应({ success: true, message: `已生成 ${count} 条访问链接，${country} 池有 ${Number(poolState?.healthy)} 个已验证出口；连接时将重新核验`, links: created }, 201);
 		}
 
 		if (pathname === '/admin/access/api/links/action') {
@@ -2305,14 +2482,16 @@ async function 处理访问链接管理请求(request, env, host, userID, UA, ur
 			if (!imported) throw new Error(summaries.find(item => item.error)?.error || `${country} 数据源暂无可用记录`);
 			const health = await 检测访问PROXYIP池(env, country, 8);
 			await 写入审计日志(env, request, 管理员会话, 'proxy.pool.sync', 'country', country, null, { imported, health }, true);
-			return 访问JSON响应({ success: true, message: `${country} 已同步 ${imported} 个候选，检测通过 ${health.success} 个`, summaries, health });
+			const reason = health.errors.slice(0, 3).map(item => `${item.proxy_ip}：${item.error}`).join('；');
+			return 访问JSON响应({ success: true, message: `${country} 已同步 ${imported} 个候选，检测通过 ${health.success} 个，失败 ${health.failed} 个，检测服务异常 ${health.unavailable} 个${reason ? '；' + reason : ''}`, summaries, health });
 		}
 
 		if (pathname === '/admin/access/api/pools/check') {
 			const country = 标准化访问国家(body.country);
 			const health = await 检测访问PROXYIP池(env, country, body.limit || 8);
 			await 写入审计日志(env, request, 管理员会话, 'proxy.pool.check', 'country', country, null, health, true);
-			return 访问JSON响应({ success: true, message: `${country} 检测完成：可用 ${health.success}，失败 ${health.failed}，检测服务异常 ${health.unavailable}`, health });
+			const reason = health.errors.slice(0, 3).map(item => `${item.proxy_ip}：${item.error}`).join('；');
+			return 访问JSON响应({ success: true, message: `${country} 检测完成：可用 ${health.success}，失败 ${health.failed}，检测服务异常 ${health.unavailable}${reason ? '；' + reason : ''}`, health });
 		}
 
 		if (pathname === '/admin/access/api/sources') {
@@ -2375,10 +2554,10 @@ function 访问链接增强管理页面() {
 <section class="grid"><form class="card" id="createForm"><h2>生成访问链接</h2><div class="notice">0 表示不限制。开启首次 IP 绑定后，首次真实连接的客户端 IP 将成为唯一允许 IP。</div><div class="form-grid"><label>国家<input name="country" list="countryOptions" placeholder="名称或代码" required></label><label>有效时长（小时）<input name="durationHours" list="durationOptions" value="3" required></label><label>数量（最多 100）<input name="count" type="number" min="1" max="100" value="1" required></label><label>备注<input name="note" maxlength="100"></label><label>并发上限<input name="maxConcurrentConnections" type="number" min="0" max="10000" value="0"></label><label>累计上限<input name="maxTotalConnections" type="number" min="0" max="10000000" value="0"></label><label>标签（逗号分隔）<input name="tags" maxlength="300"></label><label><span>客户端绑定</span><select name="bindFirstIp"><option value="0">不绑定</option><option value="1">绑定首次 IP</option></select></label></div><p><button>生成链接</button></p></form>
 <section class="card"><h2>运维与备份</h2><div class="notice" id="notifyState">通知配置读取中…</div><div class="actions"><button class="alt" data-export="json">导出筛选 JSON</button><button class="alt" data-export="csv">导出筛选 CSV</button><button class="alt" id="backupExport">导出 D1 备份</button><label class="ghost" style="padding:7px 10px;border:1px solid var(--line);border-radius:8px;cursor:pointer">恢复备份<input class="sr-only" id="backupFile" type="file" accept="application/json"></label></div><p class="muted">恢复默认仅插入不存在的数据；覆盖恢复会要求再次输入确认文本。</p></section></section>
 <datalist id="countryOptions">${国家选项HTML}</datalist><datalist id="durationOptions"><option value="1"><option value="3"><option value="8"><option value="24"><option value="72"><option value="permanent"></datalist>
-<section class="card" id="linksCard"><h2>访问链接</h2><form class="filters" id="filters"><label>搜索<input name="q" type="search" maxlength="100" placeholder="ID / 备注 / UUID / IP"></label><label>状态<select name="status"><option value="all">全部</option><option value="unused">未使用</option><option value="active">使用中</option><option value="expired">已过期</option><option value="revoked">已停用</option></select></label><label>国家<input name="country" list="countryOptions" placeholder="全部"></label><label>标签<input name="tag" maxlength="30"></label><label>到期<select name="expiry"><option value="all">全部</option><option value="24h">24 小时内</option><option value="7d">7 天内</option><option value="expired">已过期</option></select></label><button>应用筛选</button></form>
+<section class="card" id="linksCard"><h2>访问链接</h2><p class="notice">国家节点仅使用实测出口国家一致的地址。检测失败或没有匹配出口时拒绝连接；不会回退到其他国家。</p><form class="filters" id="filters"><label>搜索<input name="q" type="search" maxlength="100" placeholder="ID / 备注 / UUID / IP"></label><label>状态<select name="status"><option value="all">全部</option><option value="unused">未使用</option><option value="active">使用中</option><option value="expired">已过期</option><option value="revoked">已停用</option></select></label><label>国家<input name="country" list="countryOptions" placeholder="全部"></label><label>标签<input name="tag" maxlength="30"></label><label>到期<select name="expiry"><option value="all">全部</option><option value="24h">24 小时内</option><option value="7d">7 天内</option><option value="expired">已过期</option></select></label><button>应用筛选</button></form>
 <div class="toolbar"><label><input id="selectAll" type="checkbox" style="width:auto"> 本页全选</label><span id="selectedCount" class="muted">已选 0 条</span><select id="bulkAction" aria-label="批量操作"><option value="">批量操作…</option><option value="export">导出订阅和链接</option><option value="revoke">停用</option><option value="restore">恢复</option><option value="renew">续期</option><option value="reset">重置计时</option><option value="reassign">重选 IP</option><option value="tags">修改标签</option><option value="rotate">轮换凭据</option><option value="delete">删除</option></select><button type="button" id="runBulk" disabled>执行</button><span style="flex:1"></span><label>每页<select id="pageSize"><option>10</option><option selected>20</option><option>50</option></select></label><div class="pagination"><button class="small alt" data-page="prev">上一页</button><span id="pageInfo" class="muted"></span><button class="small alt" data-page="next">下一页</button></div></div>
-<div class="tablewrap desktop-links"><table><thead><tr><th></th><th>ID / 备注</th><th>国家</th><th>状态</th><th>有效时长</th><th>剩余时间</th><th>最后使用</th><th>当前 / 累计</th><th>PROXYIP</th><th>操作</th></tr></thead><tbody id="links"></tbody></table></div><div class="cards" id="linkCards"></div></section>
-<section class="card"><h2>国家 PROXYIP 健康</h2><div class="pool-grid" id="poolStats"></div><details><summary>最近 500 条 IP</summary><div class="tablewrap"><table><thead><tr><th>国家</th><th>PROXYIP</th><th>健康</th><th>评分</th><th>延迟</th><th>真实成功 / 失败</th><th>最后检测</th></tr></thead><tbody id="pools"></tbody></table></div></details></section>
+<div class="tablewrap desktop-links"><table><thead><tr><th></th><th>ID / 备注</th><th>国家</th><th>状态</th><th>有效时长</th><th>剩余时间</th><th>最后使用</th><th>当前 / 累计</th><th>反代地址 / 实测出口</th><th>操作</th></tr></thead><tbody id="links"></tbody></table></div><div class="cards" id="linkCards"></div></section>
+<section class="card"><h2>国家 PROXYIP 健康</h2><div class="toolbar"><label style="display:flex;align-items:center;gap:8px;color:var(--text)"><input id="skipIpwhoIs" type="checkbox" role="switch" aria-describedby="verificationHint verificationState" disabled>跳过 ipwho.is 验证</label><span id="verificationState" class="muted" aria-live="polite">设置读取中…</span></div><p id="verificationHint" class="muted">开启后以出口检测接口返回的国家为准，跳过 ipwho.is 二次查询。设置自动保存，适用于后台检测和实际连接；切换后请重新检测。</p><div class="pool-grid" id="poolStats"></div><details><summary>最近 500 条 IP</summary><div class="tablewrap"><table><thead><tr><th>国家</th><th>PROXYIP</th><th>健康</th><th>评分</th><th>延迟</th><th>真实成功 / 失败</th><th>最后检测</th></tr></thead><tbody id="pools"></tbody></table></div></details></section>
 <section class="card"><h2>数据源</h2><div class="actions"><form id="syncForm" class="actions"><input name="country" list="countryOptions" placeholder="国家" required><button>同步并检测</button></form></div><details><summary>手动添加 IP / 数据源</summary><div class="grid"><form id="poolForm"><label>国家<input name="country" list="countryOptions" required></label><label>PROXYIP<textarea name="proxyIps" required></textarea></label><button>加入 IP 池</button></form><form id="sourceForm"><label>名称<input name="name" maxlength="80" required></label><label>HTTPS 地址<input name="url" type="url" required></label><label>默认国家<input name="defaultCountry" list="countryOptions"></label><label>刷新分钟<input name="refreshMinutes" type="number" min="5" max="1440" value="60"></label><label>每国上限<input name="maxPerCountry" type="number" min="10" max="200" value="100"></label><button>保存数据源</button></form></div></details><div class="tablewrap"><table><thead><tr><th>名称</th><th>地址</th><th>状态</th><th>失败次数</th><th>操作</th></tr></thead><tbody id="sources"></tbody></table></div></section>
 <section class="card"><h2>安全审计</h2><form class="toolbar" id="auditFilters"><input name="q" placeholder="操作 / 对象 / 错误"><input name="action" placeholder="精确操作类型"><button>筛选</button><button type="button" class="alt" data-audit-export="json">JSON</button><button type="button" class="alt" data-audit-export="csv">CSV</button></form><div class="tablewrap"><table><thead><tr><th>时间</th><th>操作</th><th>对象</th><th>来源</th><th>结果</th><th>摘要</th></tr></thead><tbody id="audit"></tbody></table></div><div class="pagination"><button class="small alt" data-audit-page="prev">上一页</button><span id="auditPage" class="muted"></span><button class="small alt" data-audit-page="next">下一页</button></div></section>
 </main><div class="toast-area" id="toasts" aria-live="polite"></div>
@@ -2398,12 +2577,14 @@ const statusNames={unused:'未使用',active:'使用中',expired:'已过期',rev
 function remaining(x){if(Number(x.duration_seconds)===0&&!x.expires_at)return '永久';if(!x.expires_at)return '未开始';const ms=Number(x.expires_at)-Date.now();if(ms<=0)return '已过期';const d=Math.floor(ms/86400000),h=Math.floor(ms%86400000/3600000),m=Math.floor(ms%3600000/60000),s=Math.floor(ms%60000/1000);return (d?d+'天 ':'')+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}
 function actionMenu(x){const primary=x.display_status==='expired'?'<button class="small" data-action="renew" data-id="'+x.id+'">续期</button>':x.status==='active'?'<button class="small danger" data-action="revoke" data-id="'+x.id+'">停用</button>':'<button class="small" data-action="restore" data-id="'+x.id+'">恢复</button>';return primary+'<details class="menu"><summary>更多</summary><div class="menu-body"><button data-action="edit" data-id="'+x.id+'">编辑限制/标签</button><button data-action="renew" data-id="'+x.id+'">续期</button><button data-action="reset" data-id="'+x.id+'">重置计时</button><button data-action="reassign" data-id="'+x.id+'">重选 IP</button><button data-action="rotate" data-id="'+x.id+'">轮换凭据</button><button data-copy="'+esc(x.subscription_url)+'">复制订阅</button><button data-copy="'+esc(x.node_url)+'">复制链接</button><button class="danger" data-action="delete" data-id="'+x.id+'">删除</button></div></details>'}
 function details(x){const tagHtml=(x.tags_list||[]).map(t=>'<span class="tag">'+esc(t)+'</span>').join('')||'—';return '<details class="row-details"><summary>详情</summary><div class="detail-grid"><span>UUID</span><span class="mono">'+esc(x.uuid)+'</span><span>首次使用</span><span>'+fmt(x.first_used_at)+'</span><span>完整到期</span><span>'+fmt(x.expires_at)+'</span><span>限制</span><span>并发 '+Number(x.max_concurrent_connections||0)+' / 累计 '+Number(x.max_total_connections||0)+'</span><span>绑定</span><span>'+(Number(x.bind_first_ip)?(x.bound_ip?'已绑定':'等待首次 IP'):'未启用')+'</span><span>标签</span><span>'+tagHtml+'</span></div></details>'}
-function renderLinks(){const rows=links.map(x=>'<tr><td><input type="checkbox" data-select="'+x.id+'" '+(selected.has(Number(x.id))?'checked':'')+' aria-label="选择链接 '+x.id+'"></td><td><b>#'+x.id+'</b><br>'+esc(x.note||'—')+details(x)+'</td><td>'+esc(x.country)+'</td><td class="'+esc(x.display_status)+'">'+statusNames[x.display_status]+'</td><td>'+esc(x.duration_label)+'</td><td data-countdown="'+(x.expires_at||'')+'">'+remaining(x)+'</td><td>'+fmt(x.last_used_at)+'</td><td>'+Number(x.active_connections||0)+' / '+Number(x.connection_count||0)+'</td><td class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'</td><td>'+actionMenu(x)+'</td></tr>').join('');$('#links').innerHTML=rows||'<tr><td colspan="10" class="empty">没有符合条件的链接</td></tr>';$('#linkCards').innerHTML=links.map(x=>'<article class="link-card"><div class="link-card-head"><label><input type="checkbox" data-select="'+x.id+'" '+(selected.has(Number(x.id))?'checked':'')+'> <b>#'+x.id+' '+esc(x.note||'')+'</b></label><span class="'+x.display_status+'">'+statusNames[x.display_status]+'</span></div><p>'+esc(x.country)+' · 有效时长 '+esc(x.duration_label)+' · 剩余 <span data-countdown="'+(x.expires_at||'')+'">'+remaining(x)+'</span><br>连接 '+Number(x.active_connections||0)+' / '+Number(x.connection_count||0)+'<br><span class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'</span></p>'+details(x)+'<div class="actions">'+actionMenu(x)+'</div></article>').join('')||'<div class="empty">没有符合条件的链接</div>';updateSelection()}
+function renderLinks(){const rows=links.map(x=>'<tr><td><input type="checkbox" data-select="'+x.id+'" '+(selected.has(Number(x.id))?'checked':'')+' aria-label="选择链接 '+x.id+'"></td><td><b>#'+x.id+'</b><br>'+esc(x.note||'—')+details(x)+'</td><td>'+esc(x.country)+'</td><td class="'+esc(x.display_status)+'">'+statusNames[x.display_status]+'</td><td>'+esc(x.duration_label)+'</td><td data-countdown="'+(x.expires_at||'')+'">'+remaining(x)+'</td><td>'+fmt(x.last_used_at)+'</td><td>'+Number(x.active_connections||0)+' / '+Number(x.connection_count||0)+'</td><td class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'<br><span class="muted">'+(x.country_verified_at?'实测 '+esc(x.exit_ip)+' · '+esc(x.exit_country):'出口待验证')+'</span></td><td>'+actionMenu(x)+'</td></tr>').join('');$('#links').innerHTML=rows||'<tr><td colspan="10" class="empty">没有符合条件的链接</td></tr>';$('#linkCards').innerHTML=links.map(x=>'<article class="link-card"><div class="link-card-head"><label><input type="checkbox" data-select="'+x.id+'" '+(selected.has(Number(x.id))?'checked':'')+'> <b>#'+x.id+' '+esc(x.note||'')+'</b></label><span class="'+x.display_status+'">'+statusNames[x.display_status]+'</span></div><p>'+esc(x.country)+' · 有效时长 '+esc(x.duration_label)+' · 剩余 <span data-countdown="'+(x.expires_at||'')+'">'+remaining(x)+'</span><br>连接 '+Number(x.active_connections||0)+' / '+Number(x.connection_count||0)+'<br><span class="mono">'+esc(x.proxy_ip||'首次连接时分配')+'</span><br>'+(x.country_verified_at?'实测 '+esc(x.exit_ip)+' · '+esc(x.exit_country):'出口待验证')+'</p>'+details(x)+'<div class="actions">'+actionMenu(x)+'</div></article>').join('')||'<div class="empty">没有符合条件的链接</div>';updateSelection()}
 function updateSelection(){$$('[data-select]').forEach(b=>b.checked=selected.has(Number(b.dataset.select)));$('#selectedCount').textContent='已选 '+selected.size+' 条';$('#runBulk').disabled=!selected.size||!$('#bulkAction').value;$('#selectAll').checked=links.length>0&&links.every(x=>selected.has(Number(x.id)));$('#selectAll').indeterminate=links.some(x=>selected.has(Number(x.id)))&&!links.every(x=>selected.has(Number(x.id)))}
 function closeMenus(except){$$('.menu[open]').forEach(menu=>{if(menu!==except)menu.removeAttribute('open')})}
+let savedSkipIpwhoIs=false,verificationSaving=false;
+function renderVerificationSettings(verification){if(verificationSaving)return;savedSkipIpwhoIs=verification.skip_ipwho_is===true;const toggle=$('#skipIpwhoIs');toggle.checked=savedSkipIpwhoIs;toggle.disabled=false;$('#verificationState').textContent=savedSkipIpwhoIs?'已开启：跳过 ipwho.is':'已关闭：执行 ipwho.is 验证'}
 function positionMenu(menu){const trigger=menu.querySelector('summary'),panel=menu.querySelector('.menu-body');if(!menu.open||!trigger||!panel)return;panel.style.visibility='hidden';panel.style.left='0px';panel.style.top='0px';requestAnimationFrame(()=>{if(!menu.open)return;const rect=trigger.getBoundingClientRect(),gap=8,width=panel.offsetWidth,height=panel.offsetHeight;const left=Math.max(gap,Math.min(rect.right-width,window.innerWidth-width-gap));const below=rect.bottom+6;const top=below+height<=window.innerHeight-gap?below:Math.max(gap,rect.top-height-6);panel.style.left=left+'px';panel.style.top=top+'px';panel.style.visibility='visible'})}
-async function load(){const card=$('#linksCard');card.classList.add('loading');try{const p=new URLSearchParams({...filters,limit:pageSize,offset:(page-1)*pageSize});const d=await api('state?'+p);links=d.links||[];total=Number(d.pagination.total||0);const pages=Math.max(1,Math.ceil(total/pageSize));if(page>pages){page=pages;return load()}const s=d.stats||{};$('#stats').innerHTML=[['当前连接',s.current_connections||0],['24 小时连接',(s.connections_24h||0)+' / 失败 '+(s.failure_rate_24h||0)+'%'],['健康 IP',(s.healthy_ip_ratio||0)+'%'],['低容量国家',s.low_capacity_countries||0],['链接总数',s.total||0]].map(v=>'<div class="stat"><b>'+v[1]+'</b><span>'+v[0]+'</span></div>').join('');$('#notifyState').textContent=d.security&&d.security.notifications_configured?'Webhook / Telegram 通知已配置':'通知未配置，不影响链接与健康检查';selected=new Set(Array.from(selected).filter(id=>links.some(x=>Number(x.id)===id)));renderLinks();$('#pageInfo').textContent='第 '+page+' / '+pages+' 页 · '+total+' 条';$$('[data-page="prev"]').forEach(b=>b.disabled=page<=1);$$('[data-page="next"]').forEach(b=>b.disabled=page>=pages);renderPools(d);await loadAudit()}catch(e){const message=e&&e.message?e.message:'未知错误';toast(message,'error');$('#notifyState').textContent='通知配置读取失败：'+message;$('#notifyState').classList.add('errorbox');$('#links').innerHTML='<tr><td colspan="9" class="errorbox">加载失败：'+esc(message)+'</td></tr>'}finally{card.classList.remove('loading')}}
-function renderPools(d){$('#poolStats').innerHTML=(d.poolStats||[]).map(x=>'<article class="pool-card"><b>'+esc(x.country)+'</b><div>健康 '+Number(x.healthy||0)+' / '+Number(x.total||0)+' · 隔离 '+Number(x.isolated||0)+'</div><div>分配 '+Number(x.assigned||0)+' · 延迟 '+(x.average_latency_ms==null?'—':x.average_latency_ms+' ms')+'</div><div class="'+(Number(x.healthy)<Number(x.min_healthy_ips)?'warning':'healthy')+'">阈值 '+Number(x.min_healthy_ips)+' · 评分 '+Number(x.average_health_score||0)+'</div><div class="actions"><button class="small" data-sync-country="'+esc(x.country)+'">同步</button><button class="small alt" data-check-country="'+esc(x.country)+'">检测</button><button class="small alt" data-threshold-country="'+esc(x.country)+'" data-threshold="'+Number(x.min_healthy_ips)+'">阈值</button></div></article>').join('')||'<div class="empty">还没有国家 IP 池</div>';$('#pools').innerHTML=(d.pools||[]).map(x=>'<tr><td>'+esc(x.country)+'</td><td class="mono">'+esc(x.proxy_ip)+'</td><td class="'+esc(x.health_status||'unknown')+'">'+esc(x.health_status||'unknown')+(x.cooldown_until&&Number(x.cooldown_until)>Date.now()?'（隔离）':'')+'</td><td>'+Number(x.health_score||0)+'</td><td>'+(x.latency_ms==null?'—':Number(x.latency_ms)+' ms')+'</td><td>'+Number(x.real_success_count||0)+' / '+Number(x.real_failure_count||0)+'</td><td>'+fmt(x.last_checked_at)+'</td></tr>').join('');$('#sources').innerHTML=(d.sources||[]).map(x=>'<tr><td>'+esc(x.name)+'</td><td class="mono">'+esc(String(x.url).slice(0,90))+'</td><td class="'+(x.last_status==='error'?'unhealthy':x.last_status==='success'?'healthy':'unknown')+'">'+esc(x.last_status)+(x.last_error?'<br>'+esc(x.last_error):'')+'</td><td>'+Number(x.consecutive_failures||0)+'</td><td><button class="small alt" data-source-id="'+x.id+'" data-source-action="'+(x.enabled?'disable':'enable')+'">'+(x.enabled?'停用':'启用')+'</button>'+(String(x.url).includes('zip.cm.edu.kg')?'':'<button class="small danger" data-source-id="'+x.id+'" data-source-action="delete">删除</button>')+'</td></tr>').join('')}
+async function load(){const card=$('#linksCard');card.classList.add('loading');try{const p=new URLSearchParams({...filters,limit:pageSize,offset:(page-1)*pageSize});const d=await api('state?'+p);renderVerificationSettings(d.verification||{});links=d.links||[];total=Number(d.pagination.total||0);const pages=Math.max(1,Math.ceil(total/pageSize));if(page>pages){page=pages;return load()}const s=d.stats||{};$('#stats').innerHTML=[['当前连接',s.current_connections||0],['24 小时连接',(s.connections_24h||0)+' / 失败 '+(s.failure_rate_24h||0)+'%'],['健康 IP',(s.healthy_ip_ratio||0)+'%'],['低容量国家',s.low_capacity_countries||0],['链接总数',s.total||0]].map(v=>'<div class="stat"><b>'+v[1]+'</b><span>'+v[0]+'</span></div>').join('');$('#notifyState').textContent=d.security&&d.security.notifications_configured?'Webhook / Telegram 通知已配置':'通知未配置，不影响链接与健康检查';selected=new Set(Array.from(selected).filter(id=>links.some(x=>Number(x.id)===id)));renderLinks();$('#pageInfo').textContent='第 '+page+' / '+pages+' 页 · '+total+' 条';$$('[data-page="prev"]').forEach(b=>b.disabled=page<=1);$$('[data-page="next"]').forEach(b=>b.disabled=page>=pages);renderPools(d);await loadAudit()}catch(e){const message=e&&e.message?e.message:'未知错误';toast(message,'error');$('#notifyState').textContent='通知配置读取失败：'+message;$('#notifyState').classList.add('errorbox');$('#links').innerHTML='<tr><td colspan="9" class="errorbox">加载失败：'+esc(message)+'</td></tr>'}finally{card.classList.remove('loading')}}
+function renderPools(d){$('#poolStats').innerHTML=(d.poolStats||[]).map(x=>'<article class="pool-card"><b>'+esc(x.country)+'</b><div>健康 '+Number(x.healthy||0)+' / '+Number(x.total||0)+' · 隔离 '+Number(x.isolated||0)+'</div><div>分配 '+Number(x.assigned||0)+' · 延迟 '+(x.average_latency_ms==null?'—':x.average_latency_ms+' ms')+'</div><div class="'+(Number(x.healthy)<Number(x.min_healthy_ips)?'warning':'healthy')+'">阈值 '+Number(x.min_healthy_ips)+' · 评分 '+Number(x.average_health_score||0)+'</div><div class="actions"><button class="small" data-sync-country="'+esc(x.country)+'">同步</button><button class="small alt" data-check-country="'+esc(x.country)+'">检测</button><button class="small alt" data-threshold-country="'+esc(x.country)+'" data-threshold="'+Number(x.min_healthy_ips)+'">阈值</button></div></article>').join('')||'<div class="empty">还没有国家 IP 池</div>';$('#pools').innerHTML=(d.pools||[]).map(x=>'<tr><td>'+esc(x.country)+'</td><td class="mono">'+esc(x.proxy_ip)+'<br><span class="muted">'+(x.country_verified_at?'实测 '+esc(x.exit_ip)+' · '+esc(x.exit_country):'出口未通过验证')+'</span>'+(x.country_error?'<br><span class="unhealthy">'+esc(x.country_error)+'</span>':'')+'</td><td class="'+esc(x.health_status||'unknown')+'">'+esc(x.health_status||'unknown')+(x.cooldown_until&&Number(x.cooldown_until)>Date.now()?'（隔离）':'')+'</td><td>'+Number(x.health_score||0)+'</td><td>'+(x.latency_ms==null?'—':Number(x.latency_ms)+' ms')+'</td><td>'+Number(x.real_success_count||0)+' / '+Number(x.real_failure_count||0)+'</td><td>'+fmt(x.last_checked_at)+'</td></tr>').join('');$('#sources').innerHTML=(d.sources||[]).map(x=>'<tr><td>'+esc(x.name)+'</td><td class="mono">'+esc(String(x.url).slice(0,90))+'</td><td class="'+(x.last_status==='error'?'unhealthy':x.last_status==='success'?'healthy':'unknown')+'">'+esc(x.last_status)+(x.last_error?'<br>'+esc(x.last_error):'')+'</td><td>'+Number(x.consecutive_failures||0)+'</td><td><button class="small alt" data-source-id="'+x.id+'" data-source-action="'+(x.enabled?'disable':'enable')+'">'+(x.enabled?'停用':'启用')+'</button>'+(String(x.url).includes('zip.cm.edu.kg')?'':'<button class="small danger" data-source-id="'+x.id+'" data-source-action="delete">删除</button>')+'</td></tr>').join('')}
 async function loadAudit(){const p=new URLSearchParams({...auditFilter,limit:20,offset:(auditPage-1)*20}),d=await api('audit?'+p);auditTotal=Number(d.pagination.total||0);$('#audit').innerHTML=(d.logs||[]).map(x=>'<tr><td>'+fmt(x.created_at)+'</td><td>'+esc(x.action)+'</td><td>'+esc(x.object_type)+' #'+esc(x.object_id)+'</td><td>'+esc(x.source_ip||'未记录')+(x.source_asn?' / AS'+esc(x.source_asn):'')+'</td><td class="'+(x.success?'healthy':'unhealthy')+'">'+(x.success?'成功':'失败：'+esc(x.error_message))+'</td><td><details><summary>查看</summary><pre class="audit-json">'+esc(x.before_summary||'')+'\\n→\\n'+esc(x.after_summary||'')+'</pre></details></td></tr>').join('')||'<tr><td colspan="6" class="empty">暂无审计记录</td></tr>';$('#auditPage').textContent='第 '+auditPage+' / '+Math.max(1,Math.ceil(auditTotal/20))+' 页'}
 function confirmDialog(title,message,fields){return new Promise(resolve=>{const d=$('#actionDialog'),f=$('#actionForm'),box=$('#dialogFields');let result=null;$('#dialogTitle').textContent=title;$('#dialogMessage').textContent=message;box.innerHTML=fields||'';d.addEventListener('close',()=>{f.onsubmit=null;resolve(result)},{once:true});f.onsubmit=e=>{e.preventDefault();if(e.submitter&&e.submitter.value==='confirm')result=Object.fromEntries(new FormData(f));d.close()};d.showModal()})}
 function actionSpec(action,x,count){const n=count||1,m={revoke:['停用链接','将禁止新连接；本实例连接立即关闭，其他实例最长约 30 秒发现并断开。',''],restore:['恢复链接','仅恢复已停用且尚未过期的链接；已过期链接请续期。',''],renew:['续期','未使用链接只增加总时长，仍从首次连接开始计时；已使用链接从当前到期时间或当前时间（较晚者）起增加。','<label>增加小时数<input name="hours" type="number" min="1" max="8760" value="24" required></label>'],reset:['重置计时','清除首次使用、到期、已分配 IP、绑定和全部使用统计；下一次真实连接重新计时。',''],reassign:['重选 IP','只更换 PROXYIP，不重置计时、绑定或使用统计。',''],rotate:['轮换凭据','旧凭据立即不能建立新连接；国家、IP、计时和统计保持不变。','<label>轮换范围<select name="mode"><option value="both">Token 和 UUID</option><option value="token">仅 Token</option><option value="uuid">仅 UUID</option></select></label>'],delete:['删除链接','永久删除 '+n+' 条链接及其连接事件，无法撤销。',''],tags:['修改标签','为 '+n+' 条链接设置相同标签。','<label>标签（逗号分隔）<input name="tags" maxlength="300"></label>']};if(action==='edit')return ['编辑链接','修改备注、标签、连接限制和首次 IP 绑定。','<label>备注<input name="note" maxlength="200" value="'+esc(x.note||'')+'"></label><label>标签<input name="tags" value="'+esc((x.tags_list||[]).join(','))+'"></label><label>并发上限<input name="maxConcurrentConnections" type="number" min="0" max="10000" value="'+Number(x.max_concurrent_connections||0)+'"></label><label>累计上限<input name="maxTotalConnections" type="number" min="0" max="10000000" value="'+Number(x.max_total_connections||0)+'"></label><label>首次 IP 绑定<select name="bindFirstIp"><option value="0" '+(!Number(x.bind_first_ip)?'selected':'')+'>关闭</option><option value="1" '+(Number(x.bind_first_ip)?'selected':'')+'>开启</option></select></label>'];return m[action]}
@@ -2412,6 +2593,7 @@ async function exportSelected(ids){const records=links.filter(x=>ids.includes(Nu
 $('#filters').addEventListener('submit',e=>{e.preventDefault();filters=Object.fromEntries(new FormData(e.target));page=1;selected.clear();load()});
 $('#createForm').addEventListener('submit',async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const d=await api('links',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});toast(d.message);page=1;await load()}catch(x){toast(x.message,'error')}finally{b.disabled=false}});
 $('#syncForm').addEventListener('submit',async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const d=await api('pools/sync',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});toast(d.message);await load()}catch(x){toast(x.message,'error')}finally{b.disabled=false}});
+$('#skipIpwhoIs').addEventListener('change',async e=>{const toggle=e.target;verificationSaving=true;toggle.disabled=true;$('#verificationState').textContent='正在保存…';try{const d=await api('health/settings',{method:'POST',body:JSON.stringify({skipIpwhoIs:toggle.checked})});savedSkipIpwhoIs=d.verification.skip_ipwho_is===true;toast(d.message);await load()}catch(x){toast(x.message,'error')}finally{verificationSaving=false;renderVerificationSettings({skip_ipwho_is:savedSkipIpwhoIs})}});
 for(const id of ['poolForm','sourceForm'])$('#'+id).addEventListener('submit',async e=>{e.preventDefault();const path=id==='poolForm'?'pools':'sources',b=e.submitter;b.disabled=true;try{const d=await api(path,{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});toast(d.message);await load()}catch(x){toast(x.message,'error')}finally{b.disabled=false}});
 $('#auditFilters').addEventListener('submit',e=>{e.preventDefault();auditFilter=Object.fromEntries(new FormData(e.target));auditPage=1;loadAudit()});
 $('#selectAll').addEventListener('change',e=>{links.forEach(x=>e.target.checked?selected.add(Number(x.id)):selected.delete(Number(x.id)));updateSelection()});
@@ -3894,6 +4076,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const 当前启用SOCKS5全局反代 = 当前反代配置.启用SOCKS5全局反代;
 	const 当前parsedSocks5Address = 当前反代配置.parsedSocks5Address || {};
 	const 当前访问授权上下文 = 当前反代配置.访问授权上下文 || null;
+	if (当前访问授权上下文) 校验国家出口连接配置(当前访问授权上下文, 当前反代配置);
 	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${当前反代IP} | 反代兜底: ${当前启用反代兜底 ? '是' : '否'} | 反代类型: ${当前启用SOCKS5反代 || 'proxyip'} | 全局: ${当前启用SOCKS5全局反代 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
 	let 已通过代理发送首包 = false;
@@ -3967,7 +4150,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		}
 	}
 
-	async function connectDirect(address, port, data = null, 所有反代数组 = null, 反代兜底 = true) {
+	async function connectDirect(address, port, data = null, 所有反代数组 = null, 反代兜底 = true, 失败时关闭客户端 = true) {
 		if (remoteConnWrapper.cancelled) throw new Error('连接已取消');
 		if (所有反代数组 && 所有反代数组.length > 0) {
 			for (let i = 0; i < 所有反代数组.length; i += TCP并发拨号数) {
@@ -4009,7 +4192,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				throw err;
 			}
 		} else {
-			closeSocketQuietly(ws);
+			if (失败时关闭客户端) closeSocketQuietly(ws);
 			throw new Error('[反代连接] 所有反代连接失败，且未启用反代兜底，连接终止。');
 		}
 	}
@@ -4017,6 +4200,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	async function connecttoPry(允许发送首包 = true) {
 		if (remoteConnWrapper.cancelled) return;
 		if (ws.readyState !== WebSocket.OPEN) return;
+		if (当前访问授权上下文) 校验国家出口连接配置(当前访问授权上下文, 当前反代配置);
 		if (remoteConnWrapper.connectingPromise) {
 			await remoteConnWrapper.connectingPromise;
 			return;
@@ -4057,7 +4241,27 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			} else {
 				log(`[反代连接] 代理到: ${host}:${portNum}`);
 				const 所有反代数组 = await 解析地址端口(当前反代IP, host, yourUUID);
-				newSocket = await connectDirect(atob('UFJPWFlJUC50cDEuMDkwMjI3Lnh5eg=='), 1, 本次首包数据, 所有反代数组, 当前启用反代兜底);
+				if (当前访问授权上下文) {
+					let error;
+					const backups = 当前访问授权上下文.待验证代理候选 || [];
+					for (let index = 0; index <= backups.length; index++) {
+						if (remoteConnWrapper.cancelled || ws.readyState !== WebSocket.OPEN) throw new Error('连接已取消');
+						try {
+							let addresses = 所有反代数组;
+							if (index > 0) {
+								const verified = await 验证访问代理出口(当前访问授权上下文.env, backups[index - 1], 当前访问授权上下文.记录.country);
+								当前访问授权上下文.已验证代理候选.push(verified);
+								const fixed = 获取固定访问反代地址(verified.proxy_ip);
+								addresses = [[fixed.hostname, fixed.port]];
+							}
+							newSocket = await connectDirect('', 1, 本次首包数据, addresses, false, false);
+							break;
+						} catch (err) { error = err; }
+					}
+					if (!newSocket) { closeSocketQuietly(ws); throw error || new Error('没有已验证的国家出口'); }
+				} else {
+					newSocket = await connectDirect(atob('UFJPWFlJUC50cDEuMDkwMjI3Lnh5eg=='), 1, 本次首包数据, 所有反代数组, 当前启用反代兜底);
+				}
 			}
 			if (remoteConnWrapper.cancelled || ws.readyState !== WebSocket.OPEN) { try { newSocket.close() } catch (_) { } return; }
 			if (本次发送首包) 已通过代理发送首包 = true;
@@ -4080,7 +4284,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 	remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包);
 
-	if (当前启用SOCKS5反代 && (当前启用SOCKS5全局反代 || SOCKS5白名单.some(p => new RegExp(`^${p.replace(/\*/g, '.*')}$`, 'i').test(host)))) {
+	if (当前访问授权上下文) {
+		// 国家节点始终走已验证的反代；禁止 Worker 直连和公共兜底。
+		await connecttoPry();
+	} else if (当前启用SOCKS5反代 && (当前启用SOCKS5全局反代 || SOCKS5白名单.some(p => new RegExp(`^${p.replace(/\*/g, '.*')}$`, 'i').test(host)))) {
 		log(`[TCP转发] 启用 SOCKS5/HTTP/HTTPS/TURN/SSTP 全局代理`);
 		try {
 			await connecttoPry();
@@ -4111,6 +4318,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 const DNS转发状态 = new WeakMap();
 
 async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, 访问授权上下文 = null) {
+	if (访问授权上下文) throw new Error('严格国家出口不支持 UDP DNS 直连，请在客户端使用通过代理的 HTTPS DNS');
 	let 状态 = DNS转发状态.get(webSocket);
 	if (!状态) {
 		状态 = { 缓存: new Uint8Array(0), 响应头: respHeader, 已发送: false };
@@ -8154,5 +8362,8 @@ export const __test = Object.freeze({
 	socks5Connect,
 	获取SOCKS5账号,
 	请求优选API,
-	访问链接增强管理页面
+	访问链接增强管理页面,
+	获取固定访问反代地址, 校验访问代理出口检测, 验证访问代理出口, 验证访问国家候选,
+	校验国家出口连接配置, 获取已验证国家池状态, 激活访问授权上下文, 检测访问PROXYIP池,
+	获取访问PROXYIP数据源内容, 解析访问PROXYIP数据源, 同步单个访问PROXYIP数据源, 获取国家出口检测错误
 });

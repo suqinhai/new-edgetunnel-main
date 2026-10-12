@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 import worker, { __test } from '../_worker.js';
+import { verifiedProxy, mockCountryProbe } from './helpers/country-probe.mjs';
 
 test('数据源阻止 IPv4 映射 IPv6 的本地与私网地址', () => {
   for (const host of ['[::ffff:127.0.0.1]', '[::ffff:10.0.0.1]', '[::ffff:192.168.1.1]']) {
@@ -284,12 +285,13 @@ function grpcFixture({ keepUploadOpen = false, failWrite = false, transport = 'g
   const frame = new Uint8Array([0, 0, 0, 0, header.length + 2, 10, header.length, ...header]);
   const sockets = [], statements = [];
   let uploadCancelled = false;
-  const record = { id: 1, expires_at: Date.now() + 60000 };
+  const record = { id: 1, country: 'TW', expires_at: Date.now() + 60000 };
   const DB = {
     prepare(sql) { return { sql, bind() { return this; }, async run() { return {}; }, async first() { return record; } }; },
     async batch(items) { statements.push(...items.map(item => item.sql)); return []; }
   };
   const context = { 记录: record, env: { DB }, 激活任务: Promise.resolve(record), leaseId: 'test-lease', 已释放: false };
+  context.已验证代理候选 = [verifiedProxy()];
   context.反代上下文 = { 反代IP: '203.0.113.11', 启用反代兜底: false, 启用SOCKS5反代: null, 访问授权上下文: context };
   const request = {
     body: new ReadableStream({
@@ -329,7 +331,7 @@ for (const delayedOpen of [true, false]) {
     const response = await __test.处理XHTTP请求(f.request, uuid, f.context);
     try {
       await tick();
-      assert.equal(f.sockets.length, 2);
+      assert.equal(f.sockets.length, 1, '国家节点仅拨号已验证反代，不尝试直连');
       assert.equal(f.request.fetcher.connect, originalConnect, '不能修改运行时的连接器');
       await response.body.cancel();
       assert.ok(f.sockets.every(socket => socket.didClose), '取消时应立即关闭所有正在拨号或已建立的 socket');
@@ -337,7 +339,7 @@ for (const delayedOpen of [true, false]) {
       for (const socket of f.sockets) socket.open();
       await tick();
       if (delayedOpen) assert.ok(f.sockets.every(socket => socket.writeCount === 0), '延迟拨号完成后不能再发送首包');
-      assert.equal(f.sockets.length, 2, '取消后不能发起重试');
+      assert.equal(f.sockets.length, 1, '取消后不能发起重试');
       assert.equal(f.request.body.locked, false);
       assert.equal(f.context.已释放, true);
       assert.equal(f.statements.filter(sql => sql.startsWith('DELETE FROM access_connection_leases')).length, 1);
@@ -366,7 +368,7 @@ for (const failure of [false, true]) {
       assert.equal(f.uploadCancelled, true);
       assert.equal(f.request.body.locked, false);
       assert.ok(f.sockets.every(s => s.didClose));
-      assert.equal(f.sockets.length, 2, '返回数据后不能重放首包');
+      assert.equal(f.sockets.length, 1, '返回数据后不能重放首包');
       assert.equal(f.statements.filter(sql => sql.startsWith('DELETE FROM access_connection_leases')).length, 1);
     } finally {
       for (const socket of f.sockets) socket.close();
@@ -493,7 +495,7 @@ test(`gRPC ${delayedOpen ? '拨号期间' : '连接建立后'}取消会关闭 TC
   const response = await __test.处理gRPC请求(fixture.request, uuid, fixture.context);
   try {
     await tick();
-    assert.equal(fixture.sockets.length, 2);
+    assert.equal(fixture.sockets.length, 1, '国家节点仅拨号已验证反代');
     await response.body.cancel();
     assert.ok(fixture.sockets.every(socket => socket.didClose));
     assert.equal(fixture.uploadCancelled, true);
@@ -501,7 +503,7 @@ test(`gRPC ${delayedOpen ? '拨号期间' : '连接建立后'}取消会关闭 TC
     for (const socket of fixture.sockets) socket.open();
     await tick(); await tick();
     if (delayedOpen) assert.ok(fixture.sockets.every(socket => socket.writeCount === 0));
-    assert.equal(fixture.sockets.length, 2, '取消后不能重试拨号');
+    assert.equal(fixture.sockets.length, 1, '取消后不能重试拨号');
     assert.equal(fixture.request.body.locked, false);
     assert.equal(fixture.statements.filter(sql => sql.startsWith('DELETE FROM access_connection_leases')).length, 1);
   } finally {
@@ -715,6 +717,7 @@ test('链式代理备注保留限时订阅的令牌路径，普通订阅仍使�
 
 for (const resetStage of ['beforeAdmission', 'afterAdmission', 'afterValidation']) {
   test(`计时重置与激活交错仍拒绝或断开旧连接（${resetStage}）`, { timeout: 3000 }, async t => {
+    mockCountryProbe(t);
     const { db, DB } = createDatabase(t);
     insertLink(db, null, null);
     db.prepare("INSERT INTO proxy_ip_pool(country, proxy_ip, created_at) VALUES ('TW', '203.0.113.11', ?)").run(Date.now());
@@ -787,6 +790,7 @@ for (const resetStage of ['beforeAdmission', 'afterAdmission', 'afterValidation'
 
 for (const leaseState of ['deleted', 'expired', 'valid']) {
   test(`访问心跳只续订仍有效的租约（${leaseState}）`, { timeout: 3000 }, async t => {
+    mockCountryProbe(t);
     const { db, DB } = createDatabase(t);
     insertLink(db, null, null);
     db.prepare("INSERT INTO proxy_ip_pool(country, proxy_ip, created_at) VALUES ('TW', '203.0.113.11', ?)").run(Date.now());
@@ -830,6 +834,7 @@ for (const leaseState of ['deleted', 'expired', 'valid']) {
 
 for (const rotationStage of ['beforeActivation', 'beforeAdmission', 'unchanged']) {
   test(`XHTTP 激活时校验请求 UUID（${rotationStage}）`, { timeout: 3000 }, async t => {
+    mockCountryProbe(t);
     const { db, DB } = createDatabase(t);
     insertLink(db, null, null);
     db.prepare("INSERT INTO proxy_ip_pool(country, proxy_ip, created_at) VALUES ('TW', '203.0.113.11', ?)").run(Date.now());
